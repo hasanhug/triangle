@@ -20,11 +20,12 @@
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v5: wave movement, pink-speck edition.
-   Left click (or Space / tap) toggles climb/dive — instant velocity
-   flips, straight diagonals, edge-slide at top/bottom. A tiny hot-pink
-   wedge with a bright white wave trail, over a faster-scrolling hazy wall.
-   v1 -> step1.html; v2 -> step2.html; v3 -> step3.html; v4 -> step4.html.
+   TRIANGLE RUNNER — v6: lethal ceiling, blinding trail.
+   Click/Space/tap toggles climb/dive. The very top of the screen is a
+   kill strip — touch it and you explode, then any input restarts. The
+   wave trail is now opaque white with a much brighter glow.
+   v1 -> step1.html; v2 -> step2.html; v3 -> step3.html;
+   v4 -> step4.html; v5 -> step5.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
@@ -76,16 +77,24 @@ const CONFIG = {
 
   wave: {
     slope: 1.0,             // vertical speed = slope x worldSpeed; 1.0 = 45-degree diagonals
-    topMargin: 40,          // slide zones measured from the window's edges
-    bottomMargin: 40,
+    bottomMargin: 40,       // floor: the wedge slides along the bottom edge (safe)
+  },
+
+  kill: {
+    topHeight: 12,          // the very top strip is lethal — "where the background ends"
+    color: "#ff2244",       // (nothing below this strip can kill you)
+    edge: "#ffb3c0",        // hot lower edge marking the exact boundary
+    ring: { max: 70, dur: 0.45 },   // death explosion rings
   },
 
   trail: {
     enabled: true,
-    color: "#ffffff",       // bright white glow ribbon
+    color: "#ffffff",       // white ribbon
     maxAge: 0.7,            // seconds the ribbon lives (~180px at 260 px/s)
     width: 3,
-    alpha: 0.8,
+    opaque: true,           // v6: solid core, no alpha fade along the ribbon
+    glow: 14,               // v6: much brighter — shadow-blurred core + wide halos
+    alpha: 0.8,             // only used when opaque is false
   },
 
   // Idle hover — v3: disabled (user preference: no wavy up/down motion).
@@ -109,6 +118,9 @@ let worldSpeed = CONFIG.speedStart;   // player's true speed; future ramp goes h
 let groundY = 0;          // idle lane height
 let firstInput = false;   // trail only exists after the player first moves
 const trail = [];         // ribbon points: {x, y, age}; head pushed every frame
+let dead = false;         // v6: touched the kill strip
+let deathT = 0;           // seconds since death (drives the explosion + prompt)
+let deathX = 0, deathY = 0;
 
 const player = {
   x: 0,        // horizontal lane anchor (center of the wedge; fixed on screen)
@@ -235,8 +247,25 @@ function resize() {
 /* ---------- input: click / Space / tap toggles the wave -------------- */
 
 function toggleDirection() {
-  player.dir = (player.dir === 0) ? -1 : -player.dir;   // first click climbs
+  if (dead) { restart(); return; }                        // any input restarts after death
+  player.dir = (player.dir === 0) ? -1 : -player.dir;     // first click climbs
   firstInput = true;
+}
+
+function die() {
+  dead = true;
+  deathT = 0;
+  deathX = player.x;
+  deathY = player.y;
+}
+
+function restart() {
+  dead = false;
+  deathT = 0;
+  player.dir = 0;
+  player.y = groundY;
+  trail.length = 0;
+  firstInput = false;
 }
 
 window.addEventListener("mousedown", function (e) {
@@ -265,34 +294,38 @@ function update(dt) {
 
   player.bobT += dt;
 
-  // Wave movement: instant velocity, straight diagonals, slide at the edges.
-  if (player.dir !== 0) {
-    player.y += player.dir * worldSpeed * CONFIG.wave.slope * dt;
-    const topLimit = CONFIG.wave.topMargin;
-    const bottomLimit = H - CONFIG.wave.bottomMargin;
-    if (player.y < topLimit) player.y = topLimit;         // slide along the ceiling
-    if (player.y > bottomLimit) player.y = bottomLimit;   // slide along the floor
+  if (dead) {
+    deathT += dt;               // explosion timing; the world keeps scrolling
   } else {
-    player.y = groundY;         // parked on the idle lane until the first click
+    // Wave movement: instant velocity, straight diagonals. The floor slides;
+    // the ceiling is the kill strip, so nothing up there catches you.
+    if (player.dir !== 0) {
+      player.y += player.dir * worldSpeed * CONFIG.wave.slope * dt;
+      const bottomLimit = H - CONFIG.wave.bottomMargin;
+      if (player.y > bottomLimit) player.y = bottomLimit;   // slide along the floor
+      const halfH = CONFIG.player.height / 2;
+      if (player.y - halfH <= CONFIG.kill.topHeight) die(); // touched the top = dead
+    } else {
+      player.y = groundY;       // parked on the idle lane until the first click
+    }
   }
 
   // Wave trail: anchored to the world, so it drifts left at the player's
   // true speed — a nearer plane than the wall, which deepens the parallax.
-  if (firstInput) {
-    for (let i = 0; i < trail.length; i++) {
-      trail[i].x -= worldSpeed * dt;
-      trail[i].age += dt;
-    }
-    while (trail.length > 0 &&
-           (trail[0].age > CONFIG.trail.maxAge || trail[0].x < -60)) trail.shift();
-    trail.push({ x: player.x, y: player.y, age: 0 });
+  // (No outer length guard: the push below must be able to seed point #1.)
+  for (let i = 0; i < trail.length; i++) {
+    trail[i].x -= worldSpeed * dt;
+    trail[i].age += dt;
   }
+  while (trail.length > 0 &&
+         (trail[0].age > CONFIG.trail.maxAge || trail[0].x < -60)) trail.shift();
+  if (!dead && firstInput) trail.push({ x: player.x, y: player.y, age: 0 });
 
   /* ---- Future endless-runner systems slot in here --------------------
      updateObstacles(dt)   spawn on the right, move left at worldSpeed, recycle
      updateScore(dt)       score += worldSpeed * dt
      speed ramp            worldSpeed += CONFIG.speedRamp * dt
-     collisions            player vs obstacles (wave-trail edge vs hazard)
+     collisions            obstacles (the lethal top strip is already live)
      -------------------------------------------------------------------- */
 }
 
@@ -302,33 +335,43 @@ function drawTrail() {
   const tr = CONFIG.trail;
   if (!tr.enabled || trail.length < 2) return;
   const n = trail.length;      // index 0 = oldest, n-1 = newest (at the wedge)
-  const buckets = 5;
 
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.strokeStyle = CONFIG.trail.color;
+  ctx.strokeStyle = tr.color;
 
-  // soft halo under the whole ribbon
-  ctx.globalAlpha = 0.12;
-  ctx.lineWidth = tr.width * 3;
-  ctx.beginPath();
-  ctx.moveTo(trail[0].x, trail[0].y);
-  for (let i = 1; i < n; i++) ctx.lineTo(trail[i].x, trail[i].y);
-  ctx.stroke();
-
-  // bright core, fading and thinning toward the tail
-  for (let b = 0; b < buckets; b++) {
-    const lo = Math.floor(n * b / buckets);
-    const hi = Math.min(n - 1, Math.floor(n * (b + 1) / buckets));
-    if (hi <= lo) continue;
-    const t = (b + 1) / buckets;                     // 0.2 (oldest) .. 1.0 (newest)
-    ctx.globalAlpha = t * tr.alpha;
-    ctx.lineWidth = Math.max(0.5, tr.width * t);
+  const path = function (w) {                // stroke the whole ribbon at width w
+    ctx.lineWidth = w;
     ctx.beginPath();
-    ctx.moveTo(trail[lo].x, trail[lo].y);
-    for (let i = lo + 1; i <= hi; i++) ctx.lineTo(trail[i].x, trail[i].y);
+    ctx.moveTo(trail[0].x, trail[0].y);
+    for (let i = 1; i < n; i++) ctx.lineTo(trail[i].x, trail[i].y);
     ctx.stroke();
+  };
+
+  // v6: much brighter glow — two halo passes, then a shadow-blurred core
+  ctx.globalAlpha = 0.25; path(tr.width * 5);
+  ctx.globalAlpha = 0.45; path(tr.width * 2.2);
+  if (tr.opaque) {
+    ctx.globalAlpha = 1;
+    ctx.shadowColor = tr.color;
+    ctx.shadowBlur = tr.glow * dpr;          // shadowBlur ignores the ctx transform
+    path(tr.width);
+    ctx.shadowBlur = 0;
+  } else {
+    const buckets = 5;                       // legacy look: fading, thinning tail
+    for (let b = 0; b < buckets; b++) {
+      const lo = Math.floor(n * b / buckets);
+      const hi = Math.min(n - 1, Math.floor(n * (b + 1) / buckets));
+      if (hi <= lo) continue;
+      const t = (b + 1) / buckets;           // 0.2 (oldest) .. 1.0 (newest)
+      ctx.globalAlpha = t * tr.alpha;
+      ctx.lineWidth = Math.max(0.5, tr.width * t);
+      ctx.beginPath();
+      ctx.moveTo(trail[lo].x, trail[lo].y);
+      for (let i = lo + 1; i <= hi; i++) ctx.lineTo(trail[i].x, trail[i].y);
+      ctx.stroke();
+    }
   }
   ctx.restore();
 }
@@ -365,6 +408,46 @@ function drawPlayer() {
   ctx.restore();
 }
 
+function drawKillStrip() {
+  const k = CONFIG.kill;
+  ctx.save();
+  ctx.shadowColor = k.color;
+  ctx.shadowBlur = 10 * dpr;
+  ctx.fillStyle = k.color;
+  ctx.fillRect(0, 0, W, k.topHeight);        // the block itself
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = k.edge;                    // hot edge = the exact lethal boundary
+  ctx.fillRect(0, k.topHeight - 2, W, 2);
+  ctx.restore();
+}
+
+function drawDeath() {
+  const k = CONFIG.kill.ring;
+  const t = Math.min(1, deathT / k.dur);
+  const ease = 1 - (1 - t) * (1 - t);        // ease-out expansion
+
+  ctx.save();
+  ctx.globalAlpha = 1 - t;
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = CONFIG.player.outline;   // pale pink ring
+  ctx.beginPath(); ctx.arc(deathX, deathY, ease * k.max, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = "#ffffff";               // white core ring
+  ctx.beginPath(); ctx.arc(deathX, deathY, ease * k.max * 0.6, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+
+  if (deathT > 0.25) {                       // restart prompt fades in
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, (deathT - 0.25) * 4);
+    ctx.font = "bold 26px 'Segoe UI', system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.shadowColor = "#ffffff";
+    ctx.shadowBlur = 12 * dpr;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText("CLICK TO RESTART", W / 2, H / 2);
+    ctx.restore();
+  }
+}
+
 function draw() {
   // Wall: shift the pattern left, then fill the visible area.
   ctx.save();
@@ -385,7 +468,8 @@ function draw() {
   }
 
   drawTrail();
-  drawPlayer();
+  if (dead) drawDeath(); else drawPlayer();
+  drawKillStrip();
 }
 
 /* ---------- main loop --------------------------------------------------- */
