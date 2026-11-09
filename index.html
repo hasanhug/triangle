@@ -20,11 +20,11 @@
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v2: neon arcade look.
-   The wall is a distant, slow, dark neon brick field (smaller bricks,
-   slower scroll, deep indigo/violet palette); the runner is a tiny
-   glowing cyan wedge holding its lane.
-   v1 (close-up brown wall) is preserved in step1.html.
+   TRIANGLE RUNNER — v3: neon arcade, deep-field look.
+   A very distant, slow, hazy neon brick field (tiny bricks, compressed
+   contrast); the runner is a speck-sized glowing cyan wedge, motionless
+   in its lane (no idle bob).
+   v1 (close-up brown wall) -> step1.html; v2 -> step2.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
@@ -38,43 +38,43 @@
 
 const CONFIG = {
   speedStart: 260,          // px/sec the player moves through the world
-  wallSpeedFactor: 0.65,    // v2 depth cue: the far wall scrolls slower than the player
+  wallSpeedFactor: 0.45,    // v3 depth cue: the far wall scrolls much slower than the player
   maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
 
   wall: {
-    scale: 0.55,            // v2 depth cue: bricks at 55% size read as farther away
+    scale: 0.28,            // v3: bricks ~26x12px — twice as small as v2, far more of them
     brickW: 92,             // base brick cell size, CSS px (before scale)
     brickH: 44,
     mortar: 6,
-    colsPerTile: 12,        // tile wraps every 12 x scaled brick width
-    rowsPerTile: 6,         // (even, so the running-bond offset alternation wraps)
-    mortarColor: "#0d0d1a",
+    colsPerTile: 24,        // dense tile: the pattern repeat stays ~620px wide at this scale
+    rowsPerTile: 10,        // (even, so the running-bond offset alternation wraps)
+    mortarColor: "#0c0c18",
     hue:   [225, 305],      // each brick sampled here: deep indigo -> violet -> magenta
-    sat:   [50, 75],
-    light: [15, 30],
-    speckles: 4,            // grit dots per brick
+    sat:   [45, 65],        // v3: slightly muted + darker = hazy distance
+    light: [10, 20],
+    speckles: 0,            // v3: grit dropped — sub-pixel specks just read as dirt
     seed: 1337,             // fixed seed -> identical wall on every load & resize
   },
 
   player: {
-    width: 56,              // v2: tiny — ~4.5% of a 1280px window
-    height: 25,
+    width: 32,              // v3: speck-sized — ~2.5% of a 1280px window
+    height: 17,
     fill: "#3ee8ff",        // neon cyan
     outline: "#eafcff",     // near-white edge so the tiny sprite stays loud
-    outlineWidth: 2,
+    outlineWidth: 1.5,
     laneX: 0.30,            // runner sits at 30% of window width
     laneY: 0.56,            // and 56% of window height (the future "ground")
-    glow: { enabled: true, color: "rgba(62,232,255,0.85)", blur: 18 },
+    glow: { enabled: true, color: "rgba(62,232,255,0.85)", blur: 12 },
   },
 
-  // Idle hover, so a motionless triangle doesn't read as frozen.
-  bob: { enabled: true, amp: 2, speed: 2.4, tilt: 0.035 },
+  // Idle hover — v3: disabled (user preference: no wavy up/down motion).
+  bob: { enabled: false, amp: 2, speed: 2.4, tilt: 0.035 },
 
   // Dormant jump physics — a future step only needs player.vy = -jumpSpeed.
   gravity: 2600,
   jumpSpeed: 900,
 
-  vignette: 0.30,           // darkening at the top/bottom edges; 0 turns it off
+  vignette: 0.35,           // darkening at the top/bottom edges; 0 turns it off
 };
 
 /* ---------- canvas & global state ---------------------------------- */
