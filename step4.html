@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Triangle Runner</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #05050c;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game" role="img" aria-label="Triangle Runner: a glowing triangle zigzagging up and down past a distant dark brick wall"></canvas>
+
+<script>
+"use strict";
+/* =====================================================================
+   TRIANGLE RUNNER — v4: wave movement (Geometry Dash style).
+   Left click (or Space / tap) toggles between climbing diagonally and
+   diving diagonally — instant velocity flips, straight lines, sharp
+   corners — with a fading wave trail and edge-slide at top/bottom.
+   The far hazy neon brick wall keeps scrolling as the deep backdrop.
+   v1 -> step1.html; v2 -> step2.html; v3 -> step3.html.
+
+   Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
+
+   Layout of this file:
+     CONFIG     every tunable number & color lives here
+     wall       seamless procedural brick texture (offscreen tile)
+     input      click / Space / tap -> toggle direction
+     player     the wedge (dir: -1 up, +1 down, 0 idle)
+     trail      fading wave ribbon drifting left behind the wedge
+     update()   world simulation, one call per frame
+     draw()     wall -> vignette -> trail -> player
+   ===================================================================== */
+
+const CONFIG = {
+  speedStart: 260,          // px/sec the player moves through the world
+  wallSpeedFactor: 0.45,    // depth cue: the far wall scrolls much slower than the player
+  maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
+
+  wall: {
+    scale: 0.28,            // bricks ~26x12px — tiny, far away
+    brickW: 92,             // base brick cell size, CSS px (before scale)
+    brickH: 44,
+    mortar: 6,
+    colsPerTile: 24,        // dense tile: the pattern repeat stays ~620px wide at this scale
+    rowsPerTile: 10,        // (even, so the running-bond offset alternation wraps)
+    mortarColor: "#0c0c18",
+    hue:   [225, 305],      // each brick sampled here: deep indigo -> violet -> magenta
+    sat:   [45, 65],        // slightly muted + dark = hazy distance
+    light: [10, 20],
+    speckles: 0,            // grit dropped — sub-pixel specks just read as dirt
+    seed: 1337,             // fixed seed -> identical wall on every load & resize
+  },
+
+  player: {
+    width: 32,              // speck-sized — ~2.5% of a 1280px window
+    height: 17,
+    fill: "#3ee8ff",        // neon cyan
+    outline: "#eafcff",     // near-white edge so the tiny sprite stays loud
+    outlineWidth: 1.5,
+    laneX: 0.30,            // runner sits at 30% of window width
+    laneY: 0.56,            // idle lane before the first input
+    glow: { enabled: true, color: "rgba(62,232,255,0.85)", blur: 12 },
+  },
+
+  input: {
+    space: true,            // Space toggles too, like GD
+    touch: true,            // tap toggles on touchscreens
+  },
+
+  wave: {
+    slope: 1.0,             // vertical speed = slope x worldSpeed; 1.0 = 45-degree diagonals
+    topMargin: 40,          // slide zones measured from the window's edges
+    bottomMargin: 40,
+  },
+
+  trail: {
+    enabled: true,
+    maxAge: 0.7,            // seconds the ribbon lives (~180px at 260 px/s)
+    width: 3,
+    alpha: 0.8,
+  },
+
+  // Idle hover — v3: disabled (user preference: no wavy up/down motion).
+  bob: { enabled: false, amp: 2, speed: 2.4, tilt: 0.035 },
+
+  vignette: 0.35,           // darkening at the top/bottom edges; 0 turns it off
+};
+
+/* ---------- canvas & global state ---------------------------------- */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+let W = 0, H = 0;         // window size in CSS px
+let dpr = 1;              // device pixel ratio (sharp on HiDPI screens)
+let tileW = 0;            // wall tile size in CSS px = the wrap period
+let brickTile = null;     // offscreen canvas holding one seamless wall tile
+let wallPattern = null;
+let scrollX = 0;          // leftward travel; only (scrollX mod tileW) matters
+let worldSpeed = CONFIG.speedStart;   // player's true speed; future ramp goes here
+let groundY = 0;          // idle lane height
+let firstInput = false;   // trail only exists after the player first moves
+const trail = [];         // ribbon points: {x, y, age}; head pushed every frame
+
+const player = {
+  x: 0,        // horizontal lane anchor (center of the wedge; fixed on screen)
+  y: 0,        // current vertical center
+  dir: 0,      // wave direction: -1 climbing, +1 diving, 0 idle (pre-first-click)
+  bobT: 0,     // clock for the (currently disabled) idle hover
+};
+
+/* ---------- seeded RNG: same wall every time ----------------------- */
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- the brick wall ------------------------------------------ */
+
+function drawBrick(t, x, y, w, h, fill, clipped, rand, s) {
+  const bev = Math.max(1, 2 * s);        // bevel/detail size follows brick scale
+
+  t.fillStyle = fill;
+  t.fillRect(x, y, w, h);
+
+  // bevel: a light top edge and dark bottom edge on every brick
+  t.fillStyle = "rgba(255,255,255,0.10)";
+  t.fillRect(x, y, w, bev);
+  t.fillStyle = "rgba(0,0,0,0.22)";
+  t.fillRect(x, y + h - bev, w, bev);
+
+  // grit: a few darker speckles (skipped on seam-straddling bricks so the
+  // half-brick at the tile's left edge matches the one at its right edge)
+  if (!clipped && CONFIG.wall.speckles > 0) {
+    t.fillStyle = "rgba(0,0,0,0.14)";
+    for (let i = 0; i < CONFIG.wall.speckles; i++) {
+      const sw = Math.max(1, (2 + rand() * 2) * s);
+      const sh = Math.max(1, 2 * s);
+      t.fillRect(x + 3 + rand() * (w - 6 - sw), y + 3 + rand() * (h - 6 - sh), sw, sh);
+    }
+  }
+}
+
+function buildWall() {
+  const w = CONFIG.wall;
+  const cols = w.colsPerTile;
+  const rows = w.rowsPerTile;
+  const bw = Math.round(w.brickW * w.scale);   // integer sizes keep the tile wrap exact
+  const bh = Math.round(w.brickH * w.scale);
+  const m = w.mortar * w.scale;
+  const s = w.scale;
+  tileW = cols * bw;
+  const tileH = rows * bh;
+
+  // Render the tile at device resolution when the browser lets a pattern
+  // be scaled back down; otherwise fall back to 1x (correct, slightly soft).
+  const canScalePattern =
+    typeof CanvasPattern !== "undefined" &&
+    typeof CanvasPattern.prototype.setTransform === "function" &&
+    typeof DOMMatrix !== "undefined";
+  const scale = canScalePattern ? dpr : 1;
+
+  brickTile = document.createElement("canvas");
+  brickTile.width = Math.round(tileW * scale);
+  brickTile.height = Math.round(tileH * scale);
+  const t = brickTile.getContext("2d");
+  t.scale(scale, scale);
+
+  const rand = mulberry32(w.seed);
+
+  // mortar background: gaps appear wherever a brick isn't drawn
+  t.fillStyle = w.mortarColor;
+  t.fillRect(0, 0, tileW, tileH);
+
+  // Running bond: even rows aligned, odd rows offset half a brick.
+  // Each row gets its own list of `cols` brick colors, indexed with modulo,
+  // so the half-bricks clipped at the tile's left and right edges share a
+  // color and the tile wraps seamlessly forever.
+  for (let row = 0; row < rows; row++) {
+    const shades = [];
+    for (let i = 0; i < cols; i++) {
+      const h = w.hue[0]   + rand() * (w.hue[1]   - w.hue[0]);
+      const s2 = w.sat[0]  + rand() * (w.sat[1]   - w.sat[0]);
+      const l = w.light[0] + rand() * (w.light[1] - w.light[0]);
+      shades.push("hsl(" + h.toFixed(1) + ", " + s2.toFixed(1) + "%, " + l.toFixed(1) + "%)");
+    }
+    const y = row * bh;
+    const offset = (row % 2 === 0) ? 0 : -bw / 2;
+    for (let i = 0; i <= cols; i++) {          // cols + 1: the extra wraps around
+      const x = offset + i * bw;
+      drawBrick(t, x + m / 2, y + m / 2, bw - m, bh - m,
+                shades[i % cols], x < 0 || x + bw > tileW, rand, s);
+    }
+  }
+
+  wallPattern = ctx.createPattern(brickTile, "repeat");
+  if (canScalePattern) {
+    // Tile was drawn at device resolution; scale it back so one pattern
+    // unit equals one CSS pixel in our (already dpr-scaled) context.
+    wallPattern.setTransform(new DOMMatrix().scale(1 / scale));
+  }
+}
+
+/* ---------- sizing --------------------------------------------------- */
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // reset by the width assignment above
+  buildWall();
+  player.x = W * CONFIG.player.laneX;
+  groundY = H * CONFIG.player.laneY;
+  // A mid-flight resize re-clamps automatically on the next update().
+}
+
+/* ---------- input: click / Space / tap toggles the wave -------------- */
+
+function toggleDirection() {
+  player.dir = (player.dir === 0) ? -1 : -player.dir;   // first click climbs
+  firstInput = true;
+}
+
+window.addEventListener("mousedown", function (e) {
+  if (e.button === 0) toggleDirection();
+});
+
+if (CONFIG.input.space) {
+  window.addEventListener("keydown", function (e) {
+    if (e.code === "Space" && !e.repeat) { e.preventDefault(); toggleDirection(); }
+  });
+}
+
+if (CONFIG.input.touch) {
+  window.addEventListener("touchstart", function (e) {
+    e.preventDefault();          // also suppresses the synthesized mouse event
+    toggleDirection();
+  }, { passive: false });
+}
+
+/* ---------- simulation ------------------------------------------------ */
+
+function update(dt) {
+  // Far wall scrolls slower than the player's true speed — the depth cue.
+  scrollX += worldSpeed * CONFIG.wallSpeedFactor * dt;
+  scrollX %= tileW;             // wrap immediately: no precision drift, even after hours
+
+  player.bobT += dt;
+
+  // Wave movement: instant velocity, straight diagonals, slide at the edges.
+  if (player.dir !== 0) {
+    player.y += player.dir * worldSpeed * CONFIG.wave.slope * dt;
+    const topLimit = CONFIG.wave.topMargin;
+    const bottomLimit = H - CONFIG.wave.bottomMargin;
+    if (player.y < topLimit) player.y = topLimit;         // slide along the ceiling
+    if (player.y > bottomLimit) player.y = bottomLimit;   // slide along the floor
+  } else {
+    player.y = groundY;         // parked on the idle lane until the first click
+  }
+
+  // Wave trail: anchored to the world, so it drifts left at the player's
+  // true speed — a nearer plane than the wall, which deepens the parallax.
+  if (firstInput) {
+    for (let i = 0; i < trail.length; i++) {
+      trail[i].x -= worldSpeed * dt;
+      trail[i].age += dt;
+    }
+    while (trail.length > 0 &&
+           (trail[0].age > CONFIG.trail.maxAge || trail[0].x < -60)) trail.shift();
+    trail.push({ x: player.x, y: player.y, age: 0 });
+  }
+
+  /* ---- Future endless-runner systems slot in here --------------------
+     updateObstacles(dt)   spawn on the right, move left at worldSpeed, recycle
+     updateScore(dt)       score += worldSpeed * dt
+     speed ramp            worldSpeed += CONFIG.speedRamp * dt
+     collisions            player vs obstacles (wave-trail edge vs hazard)
+     -------------------------------------------------------------------- */
+}
+
+/* ---------- rendering -------------------------------------------------- */
+
+function drawTrail() {
+  const tr = CONFIG.trail;
+  if (!tr.enabled || trail.length < 2) return;
+  const n = trail.length;      // index 0 = oldest, n-1 = newest (at the wedge)
+  const buckets = 5;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = CONFIG.player.fill;
+
+  // soft halo under the whole ribbon
+  ctx.globalAlpha = 0.12;
+  ctx.lineWidth = tr.width * 3;
+  ctx.beginPath();
+  ctx.moveTo(trail[0].x, trail[0].y);
+  for (let i = 1; i < n; i++) ctx.lineTo(trail[i].x, trail[i].y);
+  ctx.stroke();
+
+  // bright core, fading and thinning toward the tail
+  for (let b = 0; b < buckets; b++) {
+    const lo = Math.floor(n * b / buckets);
+    const hi = Math.min(n - 1, Math.floor(n * (b + 1) / buckets));
+    if (hi <= lo) continue;
+    const t = (b + 1) / buckets;                     // 0.2 (oldest) .. 1.0 (newest)
+    ctx.globalAlpha = t * tr.alpha;
+    ctx.lineWidth = Math.max(0.5, tr.width * t);
+    ctx.beginPath();
+    ctx.moveTo(trail[lo].x, trail[lo].y);
+    for (let i = lo + 1; i <= hi; i++) ctx.lineTo(trail[i].x, trail[i].y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawPlayer() {
+  const p = CONFIG.player;
+  const b = CONFIG.bob;
+
+  const bobY = b.enabled ? Math.sin(player.bobT * b.speed) * b.amp : 0;
+  const tilt = b.enabled ? Math.sin(player.bobT * b.speed + 0.9) * b.tilt : 0;
+  const heading = tilt + player.dir * Math.atan(CONFIG.wave.slope);  // nose follows travel
+
+  ctx.save();
+  ctx.translate(player.x, player.y + bobY);
+  ctx.rotate(heading);
+
+  if (p.glow.enabled) {
+    ctx.shadowColor = p.glow.color;
+    ctx.shadowBlur = p.glow.blur * dpr;   // shadowBlur ignores the ctx transform
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(p.width * 0.55, 0);                          // nose tip (right)
+  ctx.lineTo(-p.width * 0.45, -p.height / 2);             // back, top corner
+  ctx.lineTo(-p.width * 0.45,  p.height / 2);             // back, bottom corner
+  ctx.closePath();
+
+  ctx.fillStyle = p.fill;
+  ctx.fill();
+  ctx.lineJoin = "round";
+  ctx.lineWidth = p.outlineWidth;
+  ctx.strokeStyle = p.outline;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function draw() {
+  // Wall: shift the pattern left, then fill the visible area.
+  ctx.save();
+  ctx.translate(-scrollX, 0);
+  ctx.fillStyle = wallPattern;
+  ctx.fillRect(scrollX, 0, W, H);
+  ctx.restore();
+
+  // Vignette: darker top & bottom so the wall recedes and the runner pops.
+  if (CONFIG.vignette > 0) {
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, "rgba(0,0,0," + CONFIG.vignette + ")");
+    grad.addColorStop(0.25, "rgba(0,0,0,0)");
+    grad.addColorStop(0.75, "rgba(0,0,0,0)");
+    grad.addColorStop(1, "rgba(0,0,0," + CONFIG.vignette + ")");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  drawTrail();
+  drawPlayer();
+}
+
+/* ---------- main loop --------------------------------------------------- */
+
+let last = performance.now();
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, CONFIG.maxDt);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+resize();
+window.addEventListener("resize", resize);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

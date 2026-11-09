@@ -20,12 +20,11 @@
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v4: wave movement (Geometry Dash style).
-   Left click (or Space / tap) toggles between climbing diagonally and
-   diving diagonally — instant velocity flips, straight lines, sharp
-   corners — with a fading wave trail and edge-slide at top/bottom.
-   The far hazy neon brick wall keeps scrolling as the deep backdrop.
-   v1 -> step1.html; v2 -> step2.html; v3 -> step3.html.
+   TRIANGLE RUNNER — v5: wave movement, pink-speck edition.
+   Left click (or Space / tap) toggles climb/dive — instant velocity
+   flips, straight diagonals, edge-slide at top/bottom. A tiny hot-pink
+   wedge with a bright white wave trail, over a faster-scrolling hazy wall.
+   v1 -> step1.html; v2 -> step2.html; v3 -> step3.html; v4 -> step4.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
@@ -41,7 +40,7 @@
 
 const CONFIG = {
   speedStart: 260,          // px/sec the player moves through the world
-  wallSpeedFactor: 0.45,    // depth cue: the far wall scrolls much slower than the player
+  wallSpeedFactor: 0.7,     // faster backdrop (~182 px/s) — still behind the player for parallax
   maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
 
   wall: {
@@ -60,14 +59,14 @@ const CONFIG = {
   },
 
   player: {
-    width: 32,              // speck-sized — ~2.5% of a 1280px window
-    height: 17,
-    fill: "#3ee8ff",        // neon cyan
-    outline: "#eafcff",     // near-white edge so the tiny sprite stays loud
-    outlineWidth: 1.5,
+    width: 21,              // v5: 65% of v4 — a true speck (~1.6% of a 1280px window)
+    height: 11,
+    fill: "#ff2d95",        // hot pink — contrasts the blue/violet wall AND the white trail
+    outline: "#ffc3e6",     // pale pink edge: crisp without echoing the white trail
+    outlineWidth: 1,
     laneX: 0.30,            // runner sits at 30% of window width
     laneY: 0.56,            // idle lane before the first input
-    glow: { enabled: true, color: "rgba(62,232,255,0.85)", blur: 12 },
+    glow: { enabled: true, color: "rgba(255,45,149,0.85)", blur: 8 },
   },
 
   input: {
@@ -83,6 +82,7 @@ const CONFIG = {
 
   trail: {
     enabled: true,
+    color: "#ffffff",       // bright white glow ribbon
     maxAge: 0.7,            // seconds the ribbon lives (~180px at 260 px/s)
     width: 3,
     alpha: 0.8,
@@ -307,7 +307,7 @@ function drawTrail() {
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.strokeStyle = CONFIG.player.fill;
+  ctx.strokeStyle = CONFIG.trail.color;
 
   // soft halo under the whole ribbon
   ctx.globalAlpha = 0.12;
