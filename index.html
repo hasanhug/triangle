@@ -20,10 +20,10 @@
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v6: lethal ceiling, blinding trail.
-   Click/Space/tap toggles climb/dive. The very top of the screen is a
-   kill strip — touch it and you explode, then any input restarts. The
-   wave trail is now opaque white with a much brighter glow.
+   TRIANGLE RUNNER — v6: lethal edges, blinding trail.
+   Click/Space/tap toggles climb/dive. The very top AND bottom of the
+   screen are kill strips — touch either and you explode, then any input
+   restarts. The wave trail is opaque white with a bright glow.
    v1 -> step1.html; v2 -> step2.html; v3 -> step3.html;
    v4 -> step4.html; v5 -> step5.html.
 
@@ -77,13 +77,12 @@ const CONFIG = {
 
   wave: {
     slope: 1.0,             // vertical speed = slope x worldSpeed; 1.0 = 45-degree diagonals
-    bottomMargin: 40,       // floor: the wedge slides along the bottom edge (safe)
   },
 
   kill: {
-    topHeight: 12,          // the very top strip is lethal — "where the background ends"
-    color: "#ff2244",       // (nothing below this strip can kill you)
-    edge: "#ffb3c0",        // hot lower edge marking the exact boundary
+    height: 12,             // identical lethal strips at the very top and bottom edges
+    color: "#ff2244",       // (nothing between them can kill you — yet)
+    edge: "#ffb3c0",        // hot inner edge marking each exact boundary
     ring: { max: 70, dur: 0.45 },   // death explosion rings
   },
 
@@ -297,14 +296,13 @@ function update(dt) {
   if (dead) {
     deathT += dt;               // explosion timing; the world keeps scrolling
   } else {
-    // Wave movement: instant velocity, straight diagonals. The floor slides;
-    // the ceiling is the kill strip, so nothing up there catches you.
+    // Wave movement: instant velocity, straight diagonals. Both screen
+    // edges are lethal — there is nowhere safe to slide anymore.
     if (player.dir !== 0) {
       player.y += player.dir * worldSpeed * CONFIG.wave.slope * dt;
-      const bottomLimit = H - CONFIG.wave.bottomMargin;
-      if (player.y > bottomLimit) player.y = bottomLimit;   // slide along the floor
       const halfH = CONFIG.player.height / 2;
-      if (player.y - halfH <= CONFIG.kill.topHeight) die(); // touched the top = dead
+      if (player.y - halfH <= CONFIG.kill.height) die();            // top strip
+      else if (player.y + halfH >= H - CONFIG.kill.height) die();   // bottom strip
     } else {
       player.y = groundY;       // parked on the idle lane until the first click
     }
@@ -325,7 +323,7 @@ function update(dt) {
      updateObstacles(dt)   spawn on the right, move left at worldSpeed, recycle
      updateScore(dt)       score += worldSpeed * dt
      speed ramp            worldSpeed += CONFIG.speedRamp * dt
-     collisions            obstacles (the lethal top strip is already live)
+     collisions            obstacles (the lethal top/bottom strips are live)
      -------------------------------------------------------------------- */
 }
 
@@ -414,10 +412,12 @@ function drawKillStrip() {
   ctx.shadowColor = k.color;
   ctx.shadowBlur = 10 * dpr;
   ctx.fillStyle = k.color;
-  ctx.fillRect(0, 0, W, k.topHeight);        // the block itself
+  ctx.fillRect(0, 0, W, k.height);              // top block
+  ctx.fillRect(0, H - k.height, W, k.height);   // bottom block (identical)
   ctx.shadowBlur = 0;
-  ctx.fillStyle = k.edge;                    // hot edge = the exact lethal boundary
-  ctx.fillRect(0, k.topHeight - 2, W, 2);
+  ctx.fillStyle = k.edge;                       // hot edge = each exact lethal boundary
+  ctx.fillRect(0, k.height - 2, W, 2);          // top block's lower edge
+  ctx.fillRect(0, H - k.height, W, 2);          // bottom block's upper edge
   ctx.restore();
 }
 
