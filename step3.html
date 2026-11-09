@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Triangle Runner</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #05050c;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game" role="img" aria-label="Triangle Runner: a tiny glowing triangle flying forward past a distant dark brick wall"></canvas>
+
+<script>
+"use strict";
+/* =====================================================================
+   TRIANGLE RUNNER — v3: neon arcade, deep-field look.
+   A very distant, slow, hazy neon brick field (tiny bricks, compressed
+   contrast); the runner is a speck-sized glowing cyan wedge, motionless
+   in its lane (no idle bob).
+   v1 (close-up brown wall) -> step1.html; v2 -> step2.html.
+
+   Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
+
+   Layout of this file (built to grow into an endless runner):
+     CONFIG     every tunable number & color lives here
+     wall       seamless procedural brick texture (offscreen tile)
+     player     the wedge — x/y/vy already wired for a future jump
+     update()   world simulation, one call per frame
+     draw()     wall -> vignette -> player
+   ===================================================================== */
+
+const CONFIG = {
+  speedStart: 260,          // px/sec the player moves through the world
+  wallSpeedFactor: 0.45,    // v3 depth cue: the far wall scrolls much slower than the player
+  maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
+
+  wall: {
+    scale: 0.28,            // v3: bricks ~26x12px — twice as small as v2, far more of them
+    brickW: 92,             // base brick cell size, CSS px (before scale)
+    brickH: 44,
+    mortar: 6,
+    colsPerTile: 24,        // dense tile: the pattern repeat stays ~620px wide at this scale
+    rowsPerTile: 10,        // (even, so the running-bond offset alternation wraps)
+    mortarColor: "#0c0c18",
+    hue:   [225, 305],      // each brick sampled here: deep indigo -> violet -> magenta
+    sat:   [45, 65],        // v3: slightly muted + darker = hazy distance
+    light: [10, 20],
+    speckles: 0,            // v3: grit dropped — sub-pixel specks just read as dirt
+    seed: 1337,             // fixed seed -> identical wall on every load & resize
+  },
+
+  player: {
+    width: 32,              // v3: speck-sized — ~2.5% of a 1280px window
+    height: 17,
+    fill: "#3ee8ff",        // neon cyan
+    outline: "#eafcff",     // near-white edge so the tiny sprite stays loud
+    outlineWidth: 1.5,
+    laneX: 0.30,            // runner sits at 30% of window width
+    laneY: 0.56,            // and 56% of window height (the future "ground")
+    glow: { enabled: true, color: "rgba(62,232,255,0.85)", blur: 12 },
+  },
+
+  // Idle hover — v3: disabled (user preference: no wavy up/down motion).
+  bob: { enabled: false, amp: 2, speed: 2.4, tilt: 0.035 },
+
+  // Dormant jump physics — a future step only needs player.vy = -jumpSpeed.
+  gravity: 2600,
+  jumpSpeed: 900,
+
+  vignette: 0.35,           // darkening at the top/bottom edges; 0 turns it off
+};
+
+/* ---------- canvas & global state ---------------------------------- */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+let W = 0, H = 0;         // window size in CSS px
+let dpr = 1;              // device pixel ratio (sharp on HiDPI screens)
+let tileW = 0;            // wall tile size in CSS px = the wrap period
+let brickTile = null;     // offscreen canvas holding one seamless wall tile
+let wallPattern = null;
+let scrollX = 0;          // leftward travel; only (scrollX mod tileW) matters
+let worldSpeed = CONFIG.speedStart;   // player's true speed; future ramp goes here
+let groundY = 0;          // lane height — where a future jump lands
+
+const player = {
+  x: 0,        // horizontal lane anchor (center of the wedge)
+  y: 0,        // current vertical center
+  vy: 0,       // vertical velocity — set to -CONFIG.jumpSpeed to jump (future)
+  bobT: 0,     // clock for the idle hover
+};
+
+/* ---------- seeded RNG: same wall every time ----------------------- */
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- the brick wall ------------------------------------------ */
+
+function drawBrick(t, x, y, w, h, fill, clipped, rand, s) {
+  const bev = Math.max(1, 2 * s);        // bevel/detail size follows brick scale
+
+  t.fillStyle = fill;
+  t.fillRect(x, y, w, h);
+
+  // bevel: a light top edge and dark bottom edge on every brick
+  t.fillStyle = "rgba(255,255,255,0.10)";
+  t.fillRect(x, y, w, bev);
+  t.fillStyle = "rgba(0,0,0,0.22)";
+  t.fillRect(x, y + h - bev, w, bev);
+
+  // grit: a few darker speckles (skipped on seam-straddling bricks so the
+  // half-brick at the tile's left edge matches the one at its right edge)
+  if (!clipped) {
+    t.fillStyle = "rgba(0,0,0,0.14)";
+    for (let i = 0; i < CONFIG.wall.speckles; i++) {
+      const sw = Math.max(1, (2 + rand() * 2) * s);
+      const sh = Math.max(1, 2 * s);
+      t.fillRect(x + 3 + rand() * (w - 6 - sw), y + 3 + rand() * (h - 6 - sh), sw, sh);
+    }
+  }
+}
+
+function buildWall() {
+  const w = CONFIG.wall;
+  const cols = w.colsPerTile;
+  const rows = w.rowsPerTile;
+  const bw = Math.round(w.brickW * w.scale);   // integer sizes keep the tile wrap exact
+  const bh = Math.round(w.brickH * w.scale);
+  const m = w.mortar * w.scale;
+  const s = w.scale;
+  tileW = cols * bw;
+  const tileH = rows * bh;
+
+  // Render the tile at device resolution when the browser lets a pattern
+  // be scaled back down; otherwise fall back to 1x (correct, slightly soft).
+  const canScalePattern =
+    typeof CanvasPattern !== "undefined" &&
+    typeof CanvasPattern.prototype.setTransform === "function" &&
+    typeof DOMMatrix !== "undefined";
+  const scale = canScalePattern ? dpr : 1;
+
+  brickTile = document.createElement("canvas");
+  brickTile.width = Math.round(tileW * scale);
+  brickTile.height = Math.round(tileH * scale);
+  const t = brickTile.getContext("2d");
+  t.scale(scale, scale);
+
+  const rand = mulberry32(w.seed);
+
+  // mortar background: gaps appear wherever a brick isn't drawn
+  t.fillStyle = w.mortarColor;
+  t.fillRect(0, 0, tileW, tileH);
+
+  // Running bond: even rows aligned, odd rows offset half a brick.
+  // Each row gets its own list of `cols` brick colors, indexed with modulo,
+  // so the half-bricks clipped at the tile's left and right edges share a
+  // color and the tile wraps seamlessly forever.
+  for (let row = 0; row < rows; row++) {
+    const shades = [];
+    for (let i = 0; i < cols; i++) {
+      const h = w.hue[0]   + rand() * (w.hue[1]   - w.hue[0]);
+      const s2 = w.sat[0]  + rand() * (w.sat[1]   - w.sat[0]);
+      const l = w.light[0] + rand() * (w.light[1] - w.light[0]);
+      shades.push("hsl(" + h.toFixed(1) + ", " + s2.toFixed(1) + "%, " + l.toFixed(1) + "%)");
+    }
+    const y = row * bh;
+    const offset = (row % 2 === 0) ? 0 : -bw / 2;
+    for (let i = 0; i <= cols; i++) {          // cols + 1: the extra wraps around
+      const x = offset + i * bw;
+      drawBrick(t, x + m / 2, y + m / 2, bw - m, bh - m,
+                shades[i % cols], x < 0 || x + bw > tileW, rand, s);
+    }
+  }
+
+  wallPattern = ctx.createPattern(brickTile, "repeat");
+  if (canScalePattern) {
+    // Tile was drawn at device resolution; scale it back so one pattern
+    // unit equals one CSS pixel in our (already dpr-scaled) context.
+    wallPattern.setTransform(new DOMMatrix().scale(1 / scale));
+  }
+}
+
+/* ---------- sizing --------------------------------------------------- */
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // reset by the width assignment above
+  buildWall();
+  player.x = W * CONFIG.player.laneX;
+  groundY = H * CONFIG.player.laneY;        // (note: a mid-air resize would snap to the lane — fine until jumps exist)
+}
+
+/* ---------- simulation ------------------------------------------------ */
+
+function update(dt) {
+  // Far wall scrolls slower than the player's true speed — the depth cue.
+  // (Future obstacles/ground will move at worldSpeed itself.)
+  scrollX += worldSpeed * CONFIG.wallSpeedFactor * dt;
+  scrollX %= tileW;             // wrap immediately: no precision drift, even after hours
+
+  player.bobT += dt;
+
+  // Gravity hook (dormant — nothing sets vy yet).
+  if (player.vy !== 0) {
+    player.vy += CONFIG.gravity * dt;
+    player.y += player.vy * dt;
+    if (player.y > groundY) { player.y = groundY; player.vy = 0; }
+  } else {
+    player.y = groundY;         // parked on the lane until jumping arrives
+  }
+
+  /* ---- Future endless-runner systems slot in here --------------------
+     updateObstacles(dt)   spawn on the right, move left, recycle
+     updateScore(dt)       score += worldSpeed * dt
+     speed ramp            worldSpeed += CONFIG.speedRamp * dt
+     collisions            player vs obstacles
+     input                 keydown Space -> player.vy = -CONFIG.jumpSpeed
+     -------------------------------------------------------------------- */
+}
+
+/* ---------- rendering -------------------------------------------------- */
+
+function drawPlayer() {
+  const p = CONFIG.player;
+  const b = CONFIG.bob;
+
+  const bobY = b.enabled ? Math.sin(player.bobT * b.speed) * b.amp : 0;
+  const tilt = b.enabled ? Math.sin(player.bobT * b.speed + 0.9) * b.tilt : 0;
+
+  ctx.save();
+  ctx.translate(player.x, player.y + bobY);
+  ctx.rotate(tilt);
+
+  if (p.glow.enabled) {
+    ctx.shadowColor = p.glow.color;
+    ctx.shadowBlur = p.glow.blur * dpr;   // shadowBlur ignores the ctx transform
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(p.width * 0.55, 0);                          // nose tip (right)
+  ctx.lineTo(-p.width * 0.45, -p.height / 2);             // back, top corner
+  ctx.lineTo(-p.width * 0.45,  p.height / 2);             // back, bottom corner
+  ctx.closePath();
+
+  ctx.fillStyle = p.fill;
+  ctx.fill();
+  ctx.lineJoin = "round";
+  ctx.lineWidth = p.outlineWidth;
+  ctx.strokeStyle = p.outline;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function draw() {
+  // Wall: shift the pattern left, then fill the visible area.
+  ctx.save();
+  ctx.translate(-scrollX, 0);
+  ctx.fillStyle = wallPattern;
+  ctx.fillRect(scrollX, 0, W, H);
+  ctx.restore();
+
+  // Vignette: darker top & bottom so the wall recedes and the runner pops.
+  if (CONFIG.vignette > 0) {
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, "rgba(0,0,0," + CONFIG.vignette + ")");
+    grad.addColorStop(0.25, "rgba(0,0,0,0)");
+    grad.addColorStop(0.75, "rgba(0,0,0,0)");
+    grad.addColorStop(1, "rgba(0,0,0," + CONFIG.vignette + ")");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  drawPlayer();
+}
+
+/* ---------- main loop --------------------------------------------------- */
+
+let last = performance.now();
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, CONFIG.maxDt);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+resize();
+window.addEventListener("resize", resize);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

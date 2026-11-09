@@ -15,34 +15,37 @@
 </style>
 </head>
 <body>
-<canvas id="game" role="img" aria-label="Triangle Runner: a tiny glowing triangle flying forward past a distant dark brick wall"></canvas>
+<canvas id="game" role="img" aria-label="Triangle Runner: a glowing triangle zigzagging up and down past a distant dark brick wall"></canvas>
 
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v3: neon arcade, deep-field look.
-   A very distant, slow, hazy neon brick field (tiny bricks, compressed
-   contrast); the runner is a speck-sized glowing cyan wedge, motionless
-   in its lane (no idle bob).
-   v1 (close-up brown wall) -> step1.html; v2 -> step2.html.
+   TRIANGLE RUNNER — v4: wave movement (Geometry Dash style).
+   Left click (or Space / tap) toggles between climbing diagonally and
+   diving diagonally — instant velocity flips, straight lines, sharp
+   corners — with a fading wave trail and edge-slide at top/bottom.
+   The far hazy neon brick wall keeps scrolling as the deep backdrop.
+   v1 -> step1.html; v2 -> step2.html; v3 -> step3.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
-   Layout of this file (built to grow into an endless runner):
+   Layout of this file:
      CONFIG     every tunable number & color lives here
      wall       seamless procedural brick texture (offscreen tile)
-     player     the wedge — x/y/vy already wired for a future jump
+     input      click / Space / tap -> toggle direction
+     player     the wedge (dir: -1 up, +1 down, 0 idle)
+     trail      fading wave ribbon drifting left behind the wedge
      update()   world simulation, one call per frame
-     draw()     wall -> vignette -> player
+     draw()     wall -> vignette -> trail -> player
    ===================================================================== */
 
 const CONFIG = {
   speedStart: 260,          // px/sec the player moves through the world
-  wallSpeedFactor: 0.45,    // v3 depth cue: the far wall scrolls much slower than the player
+  wallSpeedFactor: 0.45,    // depth cue: the far wall scrolls much slower than the player
   maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
 
   wall: {
-    scale: 0.28,            // v3: bricks ~26x12px — twice as small as v2, far more of them
+    scale: 0.28,            // bricks ~26x12px — tiny, far away
     brickW: 92,             // base brick cell size, CSS px (before scale)
     brickH: 44,
     mortar: 6,
@@ -50,29 +53,43 @@ const CONFIG = {
     rowsPerTile: 10,        // (even, so the running-bond offset alternation wraps)
     mortarColor: "#0c0c18",
     hue:   [225, 305],      // each brick sampled here: deep indigo -> violet -> magenta
-    sat:   [45, 65],        // v3: slightly muted + darker = hazy distance
+    sat:   [45, 65],        // slightly muted + dark = hazy distance
     light: [10, 20],
-    speckles: 0,            // v3: grit dropped — sub-pixel specks just read as dirt
+    speckles: 0,            // grit dropped — sub-pixel specks just read as dirt
     seed: 1337,             // fixed seed -> identical wall on every load & resize
   },
 
   player: {
-    width: 32,              // v3: speck-sized — ~2.5% of a 1280px window
+    width: 32,              // speck-sized — ~2.5% of a 1280px window
     height: 17,
     fill: "#3ee8ff",        // neon cyan
     outline: "#eafcff",     // near-white edge so the tiny sprite stays loud
     outlineWidth: 1.5,
     laneX: 0.30,            // runner sits at 30% of window width
-    laneY: 0.56,            // and 56% of window height (the future "ground")
+    laneY: 0.56,            // idle lane before the first input
     glow: { enabled: true, color: "rgba(62,232,255,0.85)", blur: 12 },
+  },
+
+  input: {
+    space: true,            // Space toggles too, like GD
+    touch: true,            // tap toggles on touchscreens
+  },
+
+  wave: {
+    slope: 1.0,             // vertical speed = slope x worldSpeed; 1.0 = 45-degree diagonals
+    topMargin: 40,          // slide zones measured from the window's edges
+    bottomMargin: 40,
+  },
+
+  trail: {
+    enabled: true,
+    maxAge: 0.7,            // seconds the ribbon lives (~180px at 260 px/s)
+    width: 3,
+    alpha: 0.8,
   },
 
   // Idle hover — v3: disabled (user preference: no wavy up/down motion).
   bob: { enabled: false, amp: 2, speed: 2.4, tilt: 0.035 },
-
-  // Dormant jump physics — a future step only needs player.vy = -jumpSpeed.
-  gravity: 2600,
-  jumpSpeed: 900,
 
   vignette: 0.35,           // darkening at the top/bottom edges; 0 turns it off
 };
@@ -89,13 +106,15 @@ let brickTile = null;     // offscreen canvas holding one seamless wall tile
 let wallPattern = null;
 let scrollX = 0;          // leftward travel; only (scrollX mod tileW) matters
 let worldSpeed = CONFIG.speedStart;   // player's true speed; future ramp goes here
-let groundY = 0;          // lane height — where a future jump lands
+let groundY = 0;          // idle lane height
+let firstInput = false;   // trail only exists after the player first moves
+const trail = [];         // ribbon points: {x, y, age}; head pushed every frame
 
 const player = {
-  x: 0,        // horizontal lane anchor (center of the wedge)
+  x: 0,        // horizontal lane anchor (center of the wedge; fixed on screen)
   y: 0,        // current vertical center
-  vy: 0,       // vertical velocity — set to -CONFIG.jumpSpeed to jump (future)
-  bobT: 0,     // clock for the idle hover
+  dir: 0,      // wave direction: -1 climbing, +1 diving, 0 idle (pre-first-click)
+  bobT: 0,     // clock for the (currently disabled) idle hover
 };
 
 /* ---------- seeded RNG: same wall every time ----------------------- */
@@ -126,7 +145,7 @@ function drawBrick(t, x, y, w, h, fill, clipped, rand, s) {
 
   // grit: a few darker speckles (skipped on seam-straddling bricks so the
   // half-brick at the tile's left edge matches the one at its right edge)
-  if (!clipped) {
+  if (!clipped && CONFIG.wall.speckles > 0) {
     t.fillStyle = "rgba(0,0,0,0.14)";
     for (let i = 0; i < CONFIG.wall.speckles; i++) {
       const sw = Math.max(1, (2 + rand() * 2) * s);
@@ -209,38 +228,110 @@ function resize() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // reset by the width assignment above
   buildWall();
   player.x = W * CONFIG.player.laneX;
-  groundY = H * CONFIG.player.laneY;        // (note: a mid-air resize would snap to the lane — fine until jumps exist)
+  groundY = H * CONFIG.player.laneY;
+  // A mid-flight resize re-clamps automatically on the next update().
+}
+
+/* ---------- input: click / Space / tap toggles the wave -------------- */
+
+function toggleDirection() {
+  player.dir = (player.dir === 0) ? -1 : -player.dir;   // first click climbs
+  firstInput = true;
+}
+
+window.addEventListener("mousedown", function (e) {
+  if (e.button === 0) toggleDirection();
+});
+
+if (CONFIG.input.space) {
+  window.addEventListener("keydown", function (e) {
+    if (e.code === "Space" && !e.repeat) { e.preventDefault(); toggleDirection(); }
+  });
+}
+
+if (CONFIG.input.touch) {
+  window.addEventListener("touchstart", function (e) {
+    e.preventDefault();          // also suppresses the synthesized mouse event
+    toggleDirection();
+  }, { passive: false });
 }
 
 /* ---------- simulation ------------------------------------------------ */
 
 function update(dt) {
   // Far wall scrolls slower than the player's true speed — the depth cue.
-  // (Future obstacles/ground will move at worldSpeed itself.)
   scrollX += worldSpeed * CONFIG.wallSpeedFactor * dt;
   scrollX %= tileW;             // wrap immediately: no precision drift, even after hours
 
   player.bobT += dt;
 
-  // Gravity hook (dormant — nothing sets vy yet).
-  if (player.vy !== 0) {
-    player.vy += CONFIG.gravity * dt;
-    player.y += player.vy * dt;
-    if (player.y > groundY) { player.y = groundY; player.vy = 0; }
+  // Wave movement: instant velocity, straight diagonals, slide at the edges.
+  if (player.dir !== 0) {
+    player.y += player.dir * worldSpeed * CONFIG.wave.slope * dt;
+    const topLimit = CONFIG.wave.topMargin;
+    const bottomLimit = H - CONFIG.wave.bottomMargin;
+    if (player.y < topLimit) player.y = topLimit;         // slide along the ceiling
+    if (player.y > bottomLimit) player.y = bottomLimit;   // slide along the floor
   } else {
-    player.y = groundY;         // parked on the lane until jumping arrives
+    player.y = groundY;         // parked on the idle lane until the first click
+  }
+
+  // Wave trail: anchored to the world, so it drifts left at the player's
+  // true speed — a nearer plane than the wall, which deepens the parallax.
+  if (firstInput) {
+    for (let i = 0; i < trail.length; i++) {
+      trail[i].x -= worldSpeed * dt;
+      trail[i].age += dt;
+    }
+    while (trail.length > 0 &&
+           (trail[0].age > CONFIG.trail.maxAge || trail[0].x < -60)) trail.shift();
+    trail.push({ x: player.x, y: player.y, age: 0 });
   }
 
   /* ---- Future endless-runner systems slot in here --------------------
-     updateObstacles(dt)   spawn on the right, move left, recycle
+     updateObstacles(dt)   spawn on the right, move left at worldSpeed, recycle
      updateScore(dt)       score += worldSpeed * dt
      speed ramp            worldSpeed += CONFIG.speedRamp * dt
-     collisions            player vs obstacles
-     input                 keydown Space -> player.vy = -CONFIG.jumpSpeed
+     collisions            player vs obstacles (wave-trail edge vs hazard)
      -------------------------------------------------------------------- */
 }
 
 /* ---------- rendering -------------------------------------------------- */
+
+function drawTrail() {
+  const tr = CONFIG.trail;
+  if (!tr.enabled || trail.length < 2) return;
+  const n = trail.length;      // index 0 = oldest, n-1 = newest (at the wedge)
+  const buckets = 5;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = CONFIG.player.fill;
+
+  // soft halo under the whole ribbon
+  ctx.globalAlpha = 0.12;
+  ctx.lineWidth = tr.width * 3;
+  ctx.beginPath();
+  ctx.moveTo(trail[0].x, trail[0].y);
+  for (let i = 1; i < n; i++) ctx.lineTo(trail[i].x, trail[i].y);
+  ctx.stroke();
+
+  // bright core, fading and thinning toward the tail
+  for (let b = 0; b < buckets; b++) {
+    const lo = Math.floor(n * b / buckets);
+    const hi = Math.min(n - 1, Math.floor(n * (b + 1) / buckets));
+    if (hi <= lo) continue;
+    const t = (b + 1) / buckets;                     // 0.2 (oldest) .. 1.0 (newest)
+    ctx.globalAlpha = t * tr.alpha;
+    ctx.lineWidth = Math.max(0.5, tr.width * t);
+    ctx.beginPath();
+    ctx.moveTo(trail[lo].x, trail[lo].y);
+    for (let i = lo + 1; i <= hi; i++) ctx.lineTo(trail[i].x, trail[i].y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
 
 function drawPlayer() {
   const p = CONFIG.player;
@@ -248,10 +339,11 @@ function drawPlayer() {
 
   const bobY = b.enabled ? Math.sin(player.bobT * b.speed) * b.amp : 0;
   const tilt = b.enabled ? Math.sin(player.bobT * b.speed + 0.9) * b.tilt : 0;
+  const heading = tilt + player.dir * Math.atan(CONFIG.wave.slope);  // nose follows travel
 
   ctx.save();
   ctx.translate(player.x, player.y + bobY);
-  ctx.rotate(tilt);
+  ctx.rotate(heading);
 
   if (p.glow.enabled) {
     ctx.shadowColor = p.glow.color;
@@ -292,6 +384,7 @@ function draw() {
     ctx.fillRect(0, 0, W, H);
   }
 
+  drawTrail();
   drawPlayer();
 }
 
