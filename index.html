@@ -20,11 +20,12 @@
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v8: everything red has teeth.
-   Gap columns and floating blocks now wear chunky lethal spikes; the
-   wave toggle threads you through. +1 per obstacle passed, gentle ramp,
-   best score persists. Click/Space/tap; any input restarts after death.
-   v1 -> step1.html; ... v6 -> step6.html; v7 -> step7.html.
+   TRIANGLE RUNNER — v10: levels & caves.
+   20 obstacles per level; difficulty steps up only at boundaries — and
+   each boundary is guarded by a cave: a spiked funnel that pinches to a
+   throat (tighter every level) and reopens into the harder level.
+   Click/Space/tap; any input restarts after death.
+   v1 -> step1.html; ... v8 -> step8.html; v9 -> step9.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
@@ -39,8 +40,8 @@
    ===================================================================== */
 
 const CONFIG = {
-  speedStart: 260,          // px/sec the player moves through the world
-  wallSpeedFactor: 0.7,     // faster backdrop (~182 px/s) — still behind the player for parallax
+  speedStart: 170,          // easy-start world speed; the difficulty curve owns the ramp
+  wallSpeedFactor: 0.7,     // faster backdrop — still behind the player for parallax
   maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
 
   wall: {
@@ -88,20 +89,31 @@ const CONFIG = {
 
   obstacles: {
     columnWidth: 28,        // gate column width
-    gapStart: 140,          // spikes eat 16px of gap, so effective ~124 (v7 feel)
-    gapMin: 110,
-    gapShrinkPerGate: 2,    // gentle ramp: gap tightens as score grows
-    spacingStart: 260,      // px between gates (~1s at start speed)
-    spacingMin: 200,
-    spacingShrinkPerGate: 1.5,
-    blockChance: 0.35,      // chance of a floating block between gates
     blockW: 44,
     blockH: 30,
-    speedRampPerGate: 3,    // worldSpeed += this per gate passed
-    speedMax: 420,
     color: "#ff2244",       // same hazard language as the kill strips
     edge: "#ffb3c0",
     spike: { len: 8 },      // chunky teeth on blocks + gate gap edges — lethal
+  },
+
+  difficulty: {
+    gatesPerLevel: 20,      // obstacles per level; each boundary = a cave
+    levelsToMax: 5,         // full difficulty at level 6 (t = (level-1)/5)
+    speed: [170, 420],      // world px/sec, stepped per level
+    gap: [190, 110],        // nominal gate gap (spike teeth eat 16px of it)
+    spacing: [480, 210],    // px between gates: ~2.8s at L1 -> ~0.5s at L6
+    reach: [0.4, 0.75],     // allowed altitude swing between gaps (x spacing)
+    blockChance: [0, 0.35],
+    blockStartLevel: 2,     // no floating blocks during level 1
+  },
+
+  cave: {
+    segWidth: 28,           // segment column width (matches gates)
+    segSpacing: 34,         // tight enough to read as continuous jagged walls
+    segments: 26,           // ~880px funnel
+    minGapStart: 110,       // level-1 throat, nominal (spikes eat 16px)
+    minGapShrink: 8,        // tighter per level
+    minGapFloor: 64,        // never narrower than this
   },
 
   score: {
@@ -147,6 +159,7 @@ let score = 0;            // +1 per obstacle passed
 let best = 0;             // all-time best (localStorage when available)
 let spawnDist = 0;        // distance accumulated since the last gate spawn
 let nextGapCenter = 0;    // reachability chain anchor for gap placement
+let levelFlashT = 0;      // "LEVEL n" announcement timer
 let blockSprite = null;   // pre-rendered spiked block (device resolution)
 let gateEdgeTop = null;   // spiked strip: teeth pointing down into the gap
 let gateEdgeBot = null;   // spiked strip: teeth pointing up into the gap
@@ -302,19 +315,32 @@ function restart() {
   obstacles.length = 0;      // clear the field...
   spawnDist = 0;
   score = 0;                 // ...and the score...
-  worldSpeed = CONFIG.speedStart;   // ...and the difficulty ramp
+  worldSpeed = CONFIG.speedStart;   // ...and the difficulty step
+  levelFlashT = 0;           // ...and any stale LEVEL announcement
 }
 
-/* ---------- obstacles & score ---------------------------------------- */
+/* ---------- obstacles, score & the difficulty curve ------------------ */
 
-function gateGap() {
-  const o = CONFIG.obstacles;
-  return Math.max(o.gapMin, o.gapStart - score * o.gapShrinkPerGate);
+// Levels: difficulty is constant within a level and steps up every
+// `gatesPerLevel` obstacles, reaching full difficulty at level 6+.
+function currentLevel() {
+  return Math.floor(score / CONFIG.difficulty.gatesPerLevel) + 1;
 }
 
-function gateSpacing() {
-  const o = CONFIG.obstacles;
-  return Math.max(o.spacingMin, o.spacingStart - score * o.spacingShrinkPerGate);
+function difficultyT() {
+  const d = CONFIG.difficulty;
+  return Math.min(1, (currentLevel() - 1) / d.levelsToMax);
+}
+
+function lerp(range, t) { return range[0] + (range[1] - range[0]) * t; }
+
+function gateGap()     { return lerp(CONFIG.difficulty.gap, difficultyT()); }
+function gateSpacing() { return lerp(CONFIG.difficulty.spacing, difficultyT()); }
+function gateReach()   { return lerp(CONFIG.difficulty.reach, difficultyT()); }
+
+function blockChanceNow() {
+  const d = CONFIG.difficulty;
+  return currentLevel() < d.blockStartLevel ? 0 : lerp(d.blockChance, difficultyT());
 }
 
 // Gaps stay reachable: at wave slope 1 the ship can change at most
@@ -324,7 +350,7 @@ function gateSpacing() {
 function spawnGate() {
   const o = CONFIG.obstacles;
   const gapH = gateGap();
-  const reach = gateSpacing() * CONFIG.wave.slope * 0.7;
+  const reach = gateSpacing() * CONFIG.wave.slope * gateReach();
   const anchor = (obstacles.length === 0) ? player.y : nextGapCenter;
   const corridorTop = CONFIG.kill.height + 10 + gapH / 2;
   const corridorBottom = H - CONFIG.kill.height - 10 - gapH / 2;
@@ -341,6 +367,36 @@ function spawnBlock(x) {
   const y = CONFIG.kill.height + 10 +
             Math.random() * (H - 2 * (CONFIG.kill.height + 10) - o.blockH);
   obstacles.push({ type: "block", x, y, w: o.blockW, h: o.blockH, passed: false });
+}
+
+// The cave: a score-free spiked funnel guarding each level boundary.
+// The gap pinches from the finished level's width down to a throat, then
+// reopens into the next level's width. Gate spawning pauses while the
+// cave streams past (paid off as a negative spawnDist "debt").
+function spawnCave() {
+  const c = CONFIG.cave, d = CONFIG.difficulty;
+  const level = currentLevel();                        // already the new level
+  const tPrev = Math.max(0, (level - 2) / d.levelsToMax);
+  const entryGap = lerp(d.gap, tPrev);                 // matches the level just flown
+  const exitGap = lerp(d.gap, Math.min(1, (level - 1) / d.levelsToMax));
+  const minGap = Math.max(c.minGapFloor, c.minGapStart - c.minGapShrink * (level - 2));
+
+  // straight funnel: one constant center line, clamped so the throat fits
+  const cy = Math.max(CONFIG.kill.height + 18 + minGap / 2,
+              Math.min(H - CONFIG.kill.height - 18 - minGap / 2, nextGapCenter));
+  nextGapCenter = cy;                                  // post-cave gates chain from here
+
+  const half = Math.floor(c.segments / 2);
+  for (let i = 0; i < c.segments; i++) {
+    const dist = Math.abs(i - half) / half;            // 1 at the ends, 0 at the throat
+    const wide = (i < half) ? entryGap : exitGap;
+    const gap = wide + (minGap - wide) * (1 - dist);
+    obstacles.push({ type: "gate", x: W + 60 + i * c.segSpacing,
+                     gapTop: cy - gap / 2, gapBottom: cy + gap / 2,
+                     passed: true });                  // score-free: never counts
+  }
+  spawnDist = -(c.segments * c.segSpacing + 160);      // gate debt while the cave streams
+  levelFlashT = 1.4;                                   // "LEVEL n" announcement
 }
 
 function circleRect(cx, cy, r, rx, ry, rw, rh) {
@@ -452,6 +508,7 @@ function update(dt) {
   scrollX %= tileW;             // wrap immediately: no precision drift, even after hours
 
   player.bobT += dt;
+  if (levelFlashT > 0) levelFlashT -= dt;
 
   if (dead) {
     deathT += dt;               // explosion timing; the world keeps scrolling
@@ -476,7 +533,7 @@ function update(dt) {
       if (spawnDist >= spacing) {
         spawnDist = 0;
         spawnGate();
-        if (Math.random() < CONFIG.obstacles.blockChance) {
+        if (Math.random() < blockChanceNow()) {
           spawnBlock(W + CONFIG.obstacles.columnWidth + spacing / 2);
         }
       }
@@ -489,8 +546,8 @@ function update(dt) {
       if (!ob.passed && ob.x + ow < player.x) {
         ob.passed = true;
         score++;
-        worldSpeed = Math.min(CONFIG.obstacles.speedMax,     // gentle ramp
-                              worldSpeed + CONFIG.obstacles.speedRampPerGate);
+        worldSpeed = lerp(CONFIG.difficulty.speed, difficultyT());  // level step
+        if (score % CONFIG.difficulty.gatesPerLevel === 0) spawnCave();
       }
       if (hitsObstacle(player.x, player.y, CONFIG.player.hitboxRadius, ob)) die();
     }
@@ -671,7 +728,13 @@ function drawHUD() {
   ctx.globalAlpha = 0.6;
   ctx.shadowBlur = 4 * dpr;
   ctx.font = "600 15px 'Segoe UI', system-ui, sans-serif";
-  ctx.fillText("BEST " + best, W / 2, 104);
+  ctx.fillText("BEST " + best + "  ·  LV " + currentLevel(), W / 2, 104);
+  if (levelFlashT > 0) {                       // boundary announcement
+    ctx.globalAlpha = Math.min(1, levelFlashT / 0.4);
+    ctx.shadowBlur = 14 * dpr;
+    ctx.font = "bold 34px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillText("LEVEL " + currentLevel(), W / 2, H * 0.3);
+  }
   ctx.restore();
 }
 
