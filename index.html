@@ -71,12 +71,12 @@
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v11: the lobby.
-   A neon home menu over the ambient wall: mode tiles with painted
-   mini-scenes, names and best scores. CLASSIC is the full v10 game;
-   future modes are preset overrides in MODES. Death shows RESTART /
-   LOBBY buttons; click a tile, then click to fly.
-   v1 -> step1.html; ... v9 -> step9.html; v10 -> step10.html.
+   TRIANGLE RUNNER — v12: CAVES mode.
+   The lobby now has two tiles: CLASSIC (the full v10 game) and CAVES —
+   an endless chain of narrowing, accelerating caves, each level
+   announced with the minimum clicks-per-second its throat demands,
+   plus a live CPS readout on the HUD.
+   v1 -> step1.html; ... v10 -> step10.html; v11 -> step11.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
@@ -94,6 +94,7 @@ const BASE_CONFIG = {
   speedStart: 170,          // easy-start world speed; the difficulty curve owns the ramp
   wallSpeedFactor: 0.7,     // faster backdrop — still behind the player for parallax
   maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
+  gameplay: "gates",        // "gates" (classic) or "caves" — set by mode presets
 
   wall: {
     scale: 0.28,            // bricks ~26x12px — tiny, far away
@@ -192,7 +193,27 @@ const BASE_CONFIG = {
    else. Each mode keeps its own best score under score.bestKey.        */
 
 const MODES = {
-  classic: { name: "CLASSIC", overrides: {} },   // the full v10 game as-is
+  classic: { name: "CLASSIC", thumb: "classic", overrides: {} },   // the v10 game as-is
+  caves: {
+    name: "CAVES",
+    thumb: "cave",
+    overrides: {
+      gameplay: "caves",
+      score: { bestKey: "triangleRunnerCavesBest" },
+      caveMode: {
+        gapStart: 125,        // level-1 throat, nominal (spike teeth eat 16px)
+        gapShrink: 8,         // narrower per level
+        gapFloor: 60,
+        speedStart: 170,
+        speedStep: 15,        // faster per level
+        speedMax: 320,
+        openStretch: 420,     // clear water between caves (the banner zone)
+        bannerTime: 1.6,      // seconds the level banner shows
+        segments: 26,         // funnel length, same shape as classic's caves
+        segSpacing: 34,
+      },
+    },
+  },
 };
 
 let CONFIG = null;          // the active mode's merged config
@@ -244,6 +265,9 @@ let best = 0;             // all-time best (localStorage when available)
 let spawnDist = 0;        // distance accumulated since the last gate spawn
 let nextGapCenter = 0;    // reachability chain anchor for gap placement
 let levelFlashT = 0;      // "LEVEL n" announcement timer
+let cavesLevel = 1;       // CAVES mode: current cave level
+let caveBannerT = 0;      // CAVES mode: banner countdown before each cave
+const clickTimes = [];    // timestamps of recent clicks (live CPS readout)
 let blockSprite = null;   // pre-rendered spiked block (device resolution)
 let gateEdgeTop = null;   // spiked strip: teeth pointing down into the gap
 let gateEdgeBot = null;   // spiked strip: teeth pointing up into the gap
@@ -377,6 +401,7 @@ function toggleDirection() {
   if (inLobby || dead) return;               // lobby/death handle their own input
   player.dir = (player.dir === 0) ? -1 : -player.dir;     // first click climbs
   firstInput = true;
+  clickTimes.push(performance.now());        // for the live CPS readout
 }
 
 function die() {
@@ -398,6 +423,10 @@ function restart() {
   spawnDist = 0;
   score = 0;                 // ...and the score...
   worldSpeed = CONFIG.speedStart;   // ...and the difficulty ramp
+  levelFlashT = 0;           // ...and any stale LEVEL announcement
+  cavesLevel = 1;            // ...and the caves-mode chain
+  caveBannerT = (CONFIG.gameplay === "caves") ? CONFIG.caveMode.bannerTime : 0;
+  clickTimes.length = 0;
 }
 
 /* ---------- obstacles, score & the difficulty curve ------------------ */
@@ -478,6 +507,52 @@ function spawnCave() {
   }
   spawnDist = -(c.segments * c.segSpacing + 160);      // gate debt while the cave streams
   levelFlashT = 1.4;                                   // "LEVEL n" announcement
+}
+
+/* ---------- CAVES mode: banner + narrowing cave chain ----------------- */
+
+// The honest CPS number: minimum flips/sec to stay inside a straight
+// corridor = vertical speed / usable width (gap minus spikes and ship).
+function minCPSFor(level) {
+  const cm = CONFIG.caveMode;
+  const gap = Math.max(cm.gapFloor, cm.gapStart - cm.gapShrink * (level - 1));
+  const speed = Math.min(cm.speedMax, cm.speedStart + cm.speedStep * (level - 1));
+  return Math.ceil(speed / Math.max(24, gap - 16 - CONFIG.player.height));
+}
+
+function spawnCavesCave() {
+  const cm = CONFIG.caveMode;
+  const gapMin = Math.max(cm.gapFloor, cm.gapStart - cm.gapShrink * (cavesLevel - 1));
+  const wide = gapMin + 45;                       // funnel mouth
+  const anchor = (obstacles.length === 0) ? player.y : nextGapCenter;
+  const cy = Math.max(CONFIG.kill.height + 18 + gapMin / 2,
+              Math.min(H - CONFIG.kill.height - 18 - gapMin / 2, anchor));
+  nextGapCenter = cy;
+  const half = Math.floor(cm.segments / 2);
+  for (let i = 0; i < cm.segments; i++) {
+    const dist = Math.abs(i - half) / half;       // 1 at the ends, 0 at the throat
+    const gap = wide + (gapMin - wide) * (1 - dist);
+    obstacles.push({ type: "gate", x: W + 60 + i * cm.segSpacing,
+                     gapTop: cy - gap / 2, gapBottom: cy + gap / 2,
+                     passed: true });              // the level-clear does the scoring
+  }
+  spawnDist = -(cm.segments * cm.segSpacing + cm.openStretch);
+}
+
+function updateCavesMode(dt) {
+  const cm = CONFIG.caveMode;
+  if (caveBannerT > 0) {                          // banner flies over clear water
+    caveBannerT -= dt;
+    if (caveBannerT <= 0) spawnCavesCave();       // ...then the cave streams in
+    return;
+  }
+  spawnDist += worldSpeed * dt;
+  if (spawnDist >= 0) {                           // cave + open stretch behind the ship
+    score++;                                      // cave cleared
+    cavesLevel++;
+    worldSpeed = Math.min(cm.speedMax, cm.speedStart + cm.speedStep * (cavesLevel - 1));
+    caveBannerT = cm.bannerTime;
+  }
 }
 
 function circleRect(cx, cy, r, rx, ry, rw, rh) {
@@ -611,13 +686,17 @@ function update(dt) {
     // spacing accumulator, stream left at world speed, +1 on pass, and
     // kill on contact. Everything here freezes while dead.
     if (firstInput) {
-      spawnDist += worldSpeed * dt;
-      const spacing = gateSpacing();
-      if (spawnDist >= spacing) {
-        spawnDist = 0;
-        spawnGate();
-        if (Math.random() < blockChanceNow()) {
-          spawnBlock(W + CONFIG.obstacles.columnWidth + spacing / 2);
+      if (CONFIG.gameplay === "caves") {
+        updateCavesMode(dt);                 // CAVES: banner + narrowing caves
+      } else {
+        spawnDist += worldSpeed * dt;
+        const spacing = gateSpacing();
+        if (spawnDist >= spacing) {
+          spawnDist = 0;
+          spawnGate();
+          if (Math.random() < blockChanceNow()) {
+            spawnBlock(W + CONFIG.obstacles.columnWidth + spacing / 2);
+          }
         }
       }
     }
@@ -809,8 +888,24 @@ function drawHUD() {
   ctx.globalAlpha = 0.6;
   ctx.shadowBlur = 4 * dpr;
   ctx.font = "600 15px 'Segoe UI', system-ui, sans-serif";
-  ctx.fillText("BEST " + best + "  ·  LV " + currentLevel(), W / 2, 104);
-  if (levelFlashT > 0) {                       // boundary announcement
+  const levelLabel = (CONFIG.gameplay === "caves") ? cavesLevel : currentLevel();
+  let subline = "BEST " + best + "  ·  LV " + levelLabel;
+  if (CONFIG.gameplay === "caves") {           // live clicks-per-second readout
+    const now = performance.now();
+    while (clickTimes.length > 0 && now - clickTimes[0] > 1000) clickTimes.shift();
+    subline += "  ·  CPS " + clickTimes.length;
+  }
+  ctx.fillText(subline, W / 2, 104);
+  if (CONFIG.gameplay === "caves" && caveBannerT > 0 && firstInput) {
+    const ba = Math.min(1, caveBannerT / 0.3);             // level banner
+    ctx.globalAlpha = ba;
+    ctx.shadowBlur = 14 * dpr;
+    ctx.font = "bold 34px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillText("LEVEL " + cavesLevel, W / 2, H * 0.3);
+    ctx.globalAlpha = ba * 0.75;
+    ctx.font = "600 18px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillText("MIN ~" + minCPSFor(cavesLevel) + " CLICKS/SEC", W / 2, H * 0.3 + 34);
+  } else if (levelFlashT > 0) {                // classic boundary announcement
     ctx.globalAlpha = Math.min(1, levelFlashT / 0.4);
     ctx.shadowBlur = 14 * dpr;
     ctx.font = "bold 34px 'Segoe UI', system-ui, sans-serif";
@@ -850,7 +945,7 @@ function draw() {
 /* ---------- lobby: tiles, painted thumbnails --------------------------- */
 
 // Paint a mode tile's signature mini-scene (no assets, one canvas each).
-function paintThumb(cv, cfg) {
+function paintThumb(cv, cfg, kind) {
   const t = cv.getContext("2d");
   const w = cv.width, h = cv.height;
   t.fillStyle = "#0a0a18"; t.fillRect(0, 0, w, h);
@@ -858,24 +953,38 @@ function paintThumb(cv, cfg) {
   for (let r = 0; r < 6; r++)
     for (let c = -1; c < 10; c++)
       t.fillRect(c * 22 + (r % 2 ? 11 : 0), r * 22 + 2, 19, 17);
-  t.fillStyle = cfg.kill.color;                          // lethal edges
-  t.fillRect(0, 0, w, 5); t.fillRect(0, h - 5, w, 5);
-  t.fillRect(w * 0.66, 5, 10, 36);                       // spiked gate pair
-  t.fillRect(w * 0.66, h - 41, 10, 36);
-  t.beginPath();                                         // teeth into the gap
-  t.moveTo(w * 0.66 + 1, 41); t.lineTo(w * 0.66 + 5, 47); t.lineTo(w * 0.66 + 9, 41);
-  t.moveTo(w * 0.66 + 1, h - 41); t.lineTo(w * 0.66 + 5, h - 47); t.lineTo(w * 0.66 + 9, h - 41);
-  t.fill();
-  t.strokeStyle = cfg.trail.color; t.lineWidth = 3; t.lineCap = "round";
-  t.beginPath();                                         // the wave trail
-  t.moveTo(18, h * 0.58); t.lineTo(64, h * 0.4); t.lineTo(w * 0.56, h * 0.54);
-  t.stroke();
-  const cy = h * 0.52, cx = w * 0.58;                    // the pink wedge
-  t.fillStyle = cfg.player.fill;
-  t.beginPath();
-  t.moveTo(cx + 16, cy); t.lineTo(cx - 6, cy - 6); t.lineTo(cx - 6, cy + 6);
-  t.closePath(); t.fill();
-  t.strokeStyle = cfg.player.outline; t.lineWidth = 1.5; t.stroke();
+  const wedge = (cx, cy) => {                           // ship + trail
+    t.strokeStyle = cfg.trail.color; t.lineWidth = 3; t.lineCap = "round";
+    t.beginPath();
+    t.moveTo(cx - 64, cy + 14); t.lineTo(cx - 34, cy - 10); t.lineTo(cx - 18, cy);
+    t.stroke();
+    t.fillStyle = cfg.player.fill;
+    t.beginPath();
+    t.moveTo(cx + 12, cy); t.lineTo(cx - 8, cy - 6); t.lineTo(cx - 8, cy + 6);
+    t.closePath(); t.fill();
+    t.strokeStyle = cfg.player.outline; t.lineWidth = 1.5; t.stroke();
+  };
+  t.fillStyle = cfg.kill.color;
+  if (kind === "cave") {                                 // converging walls + throat
+    t.beginPath();
+    t.moveTo(0, 0); t.lineTo(w * 0.28, 0); t.lineTo(w * 0.7, h * 0.4);
+    t.lineTo(w * 0.7, 0); t.closePath(); t.fill();
+    t.beginPath();
+    t.moveTo(0, h); t.lineTo(w * 0.28, h); t.lineTo(w * 0.7, h * 0.6);
+    t.lineTo(w * 0.7, h); t.closePath(); t.fill();
+    t.fillRect(w * 0.7, 0, 9, h * 0.4);                  // throat columns
+    t.fillRect(w * 0.7, h * 0.6, 9, h * 0.4);
+    wedge(w * 0.6, h * 0.5);
+  } else {                                               // classic: strips + gate
+    t.fillRect(0, 0, w, 5); t.fillRect(0, h - 5, w, 5);
+    t.fillRect(w * 0.66, 5, 10, 36);
+    t.fillRect(w * 0.66, h - 41, 10, 36);
+    t.beginPath();                                       // teeth into the gap
+    t.moveTo(w * 0.66 + 1, 41); t.lineTo(w * 0.66 + 5, 47); t.lineTo(w * 0.66 + 9, 41);
+    t.moveTo(w * 0.66 + 1, h - 41); t.lineTo(w * 0.66 + 5, h - 47); t.lineTo(w * 0.66 + 9, h - 41);
+    t.fill();
+    wedge(w * 0.58, h * 0.52);
+  }
 }
 
 function modeConfig(id) {
@@ -899,7 +1008,7 @@ function buildLobby() {
     btn.className = "tile";
     const cv = document.createElement("canvas");
     cv.width = 220; cv.height = 130;
-    paintThumb(cv, modeConfig(id));
+    paintThumb(cv, modeConfig(id), m.thumb || "classic");
     const name = document.createElement("span");
     name.className = "tile-name"; name.textContent = m.name;
     const bestEl = document.createElement("span");
