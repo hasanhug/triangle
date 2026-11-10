@@ -12,34 +12,85 @@
     background: #05050c;
   }
   canvas { display: block; }
+
+  /* ---------- lobby & death overlays (DOM over the canvas) ---------- */
+  #lobby {
+    position: fixed; inset: 0; z-index: 10;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 30px; background: rgba(4, 4, 12, 0.72);
+    font-family: "Segoe UI", system-ui, sans-serif;
+  }
+  #lobby h1 {
+    margin: 0; color: #fff; letter-spacing: 0.35em; font-weight: 800; font-size: 34px;
+    text-shadow: 0 0 18px rgba(255, 45, 149, 0.9), 0 0 42px rgba(62, 232, 255, 0.4);
+  }
+  #tiles { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; }
+  .tile {
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    padding: 10px 10px 14px; cursor: pointer;
+    background: rgba(10, 10, 24, 0.85);
+    border: 2px solid rgba(255, 45, 149, 0.55); border-radius: 10px;
+    box-shadow: 0 0 14px rgba(255, 45, 149, 0.25);
+    transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+  }
+  .tile:hover {
+    transform: translateY(-4px) scale(1.03);
+    border-color: #ff2d95; box-shadow: 0 0 26px rgba(255, 45, 149, 0.55);
+  }
+  .tile canvas { border-radius: 6px; display: block; }
+  .tile-name { color: #fff; font-weight: 700; letter-spacing: 0.2em; font-size: 15px; }
+  .tile-best { color: rgba(255, 255, 255, 0.55); font-size: 12px; letter-spacing: 0.15em; }
+
+  #death {
+    position: fixed; left: 50%; top: 60%; transform: translateX(-50%);
+    display: none; gap: 18px; z-index: 11;
+  }
+  #death.visible { display: flex; }
+  #death button {
+    font: 700 16px "Segoe UI", system-ui, sans-serif; letter-spacing: 0.2em;
+    color: #fff; padding: 12px 26px; cursor: pointer;
+    background: rgba(10, 10, 24, 0.85); border: 2px solid #ff2d95; border-radius: 8px;
+    box-shadow: 0 0 14px rgba(255, 45, 149, 0.4);
+  }
+  #death button:hover { box-shadow: 0 0 24px rgba(255, 45, 149, 0.8); }
 </style>
 </head>
 <body>
 <canvas id="game" role="img" aria-label="Triangle Runner: a glowing triangle zigzagging between lethal edges, dodging red gates streaming past a distant dark brick wall"></canvas>
 
+<div id="lobby">
+  <h1>TRIANGLE RUNNER</h1>
+  <div id="tiles"></div>
+</div>
+
+<div id="death">
+  <button id="btnRestart">RESTART</button>
+  <button id="btnLobby">LOBBY</button>
+</div>
+
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v10: levels & caves.
-   20 obstacles per level; difficulty steps up only at boundaries — and
-   each boundary is guarded by a cave: a spiked funnel that pinches to a
-   throat (tighter every level) and reopens into the harder level.
-   Click/Space/tap; any input restarts after death.
-   v1 -> step1.html; ... v8 -> step8.html; v9 -> step9.html.
+   TRIANGLE RUNNER — v11: the lobby.
+   A neon home menu over the ambient wall: mode tiles with painted
+   mini-scenes, names and best scores. CLASSIC is the full v10 game;
+   future modes are preset overrides in MODES. Death shows RESTART /
+   LOBBY buttons; click a tile, then click to fly.
+   v1 -> step1.html; ... v9 -> step9.html; v10 -> step10.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
    Layout of this file:
-     CONFIG     every tunable number & color lives here
+     BASE_CONFIG + MODES   every tunable number & color; per-mode overrides
      wall       seamless procedural brick texture (offscreen tile)
-     input      click / Space / tap -> toggle direction
+     input      click / Space / tap -> toggle direction (lobby/death ignore)
      player     the wedge (dir: -1 up, +1 down, 0 idle)
      trail      fading wave ribbon drifting left behind the wedge
      update()   world simulation, one call per frame
-     draw()     wall -> vignette -> trail -> player
+     draw()     wall -> vignette -> obstacles -> trail -> player -> HUD
    ===================================================================== */
 
-const CONFIG = {
+const BASE_CONFIG = {
   speedStart: 170,          // easy-start world speed; the difficulty curve owns the ramp
   wallSpeedFactor: 0.7,     // faster backdrop — still behind the player for parallax
   maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
@@ -136,9 +187,42 @@ const CONFIG = {
   vignette: 0.35,           // darkening at the top/bottom edges; 0 turns it off
 };
 
+/* ---------- game modes: presets over BASE_CONFIG --------------------- */
+/* A mode is a deep-merge override — add one object + one tile, nothing
+   else. Each mode keeps its own best score under score.bestKey.        */
+
+const MODES = {
+  classic: { name: "CLASSIC", overrides: {} },   // the full v10 game as-is
+};
+
+let CONFIG = null;          // the active mode's merged config
+let currentMode = "classic";
+let inLobby = true;         // lobby: ambient wall, no gameplay
+
+function deepClone(o) { return JSON.parse(JSON.stringify(o)); }
+
+function deepMerge(base, over) {
+  for (const k of Object.keys(over)) {
+    if (over[k] && typeof over[k] === "object" && !Array.isArray(over[k]) &&
+        base[k] && typeof base[k] === "object" && !Array.isArray(base[k]))
+      deepMerge(base[k], over[k]);
+    else base[k] = over[k];
+  }
+  return base;
+}
+
+function applyMode(id) {
+  currentMode = id;
+  CONFIG = deepMerge(deepClone(BASE_CONFIG), MODES[id].overrides);
+  best = loadBest();
+  restart();                // fresh run state (parked; the lobby stays put)
+}
+
 /* ---------- canvas & global state ---------------------------------- */
 
 const canvas = document.getElementById("game");
+const lobbyEl = document.getElementById("lobby");
+const deathEl = document.getElementById("death");
 const ctx = canvas.getContext("2d");
 
 let W = 0, H = 0;         // window size in CSS px
@@ -147,7 +231,7 @@ let tileW = 0;            // wall tile size in CSS px = the wrap period
 let brickTile = null;     // offscreen canvas holding one seamless wall tile
 let wallPattern = null;
 let scrollX = 0;          // leftward travel; only (scrollX mod tileW) matters
-let worldSpeed = CONFIG.speedStart;   // player's true speed; future ramp goes here
+let worldSpeed = BASE_CONFIG.speedStart;   // set properly by applyMode at init
 let groundY = 0;          // idle lane height
 let firstInput = false;   // trail only exists after the player first moves
 const trail = [];         // ribbon points: {x, y, age}; head pushed every frame
@@ -290,9 +374,7 @@ function resize() {
 /* ---------- input: click / Space / tap toggles the wave -------------- */
 
 function toggleDirection() {
-  // any input restarts — but only after the death screen (with the score)
-  // has been readable for a moment, so a mid-crash click can't wipe it
-  if (dead) { if (deathT >= 0.6) restart(); return; }
+  if (inLobby || dead) return;               // lobby/death handle their own input
   player.dir = (player.dir === 0) ? -1 : -player.dir;     // first click climbs
   firstInput = true;
 }
@@ -486,13 +568,13 @@ window.addEventListener("mousedown", function (e) {
   if (e.button === 0) toggleDirection();
 });
 
-if (CONFIG.input.space) {
+if (BASE_CONFIG.input.space) {
   window.addEventListener("keydown", function (e) {
     if (e.code === "Space" && !e.repeat) { e.preventDefault(); toggleDirection(); }
   });
 }
 
-if (CONFIG.input.touch) {
+if (BASE_CONFIG.input.touch) {
   window.addEventListener("touchstart", function (e) {
     e.preventDefault();          // also suppresses the synthesized mouse event
     toggleDirection();
@@ -505,6 +587,8 @@ function update(dt) {
   // Far wall scrolls slower than the player's true speed — the depth cue.
   scrollX += worldSpeed * CONFIG.wallSpeedFactor * dt;
   scrollX %= tileW;             // wrap immediately: no precision drift, even after hours
+
+  if (inLobby) return;          // lobby: the wall drifts, nothing else happens
 
   player.bobT += dt;
   if (levelFlashT > 0) levelFlashT -= dt;
@@ -676,7 +760,7 @@ function drawDeath() {
   ctx.beginPath(); ctx.arc(deathX, deathY, ease * k.max * 0.6, 0, Math.PI * 2); ctx.stroke();
   ctx.restore();
 
-  if (deathT > 0.25) {                       // restart prompt fades in
+  if (deathT > 0.25) {                       // score card (buttons are DOM)
     ctx.save();
     ctx.globalAlpha = Math.min(1, (deathT - 0.25) * 4);
     ctx.font = "bold 26px 'Segoe UI', system-ui, sans-serif";
@@ -684,9 +768,7 @@ function drawDeath() {
     ctx.shadowColor = "#ffffff";
     ctx.shadowBlur = 12 * dpr;
     ctx.fillStyle = "#ffffff";
-    ctx.fillText("CLICK TO RESTART", W / 2, H / 2);
-    ctx.font = "bold 22px 'Segoe UI', system-ui, sans-serif";
-    ctx.fillText("SCORE " + score + "  ·  BEST " + best, W / 2, H / 2 + 42);
+    ctx.fillText("SCORE " + score + "  ·  BEST " + best, W / 2, H / 2);
     ctx.restore();
   }
 }
@@ -756,11 +838,88 @@ function draw() {
     ctx.fillRect(0, 0, W, H);
   }
 
+  if (inLobby) return;          // menu backdrop: wall + vignette only
+
   drawObstacles();
   drawTrail();
   if (dead) drawDeath(); else drawPlayer();
   drawKillStrip();
   drawHUD();
+}
+
+/* ---------- lobby: tiles, painted thumbnails --------------------------- */
+
+// Paint a mode tile's signature mini-scene (no assets, one canvas each).
+function paintThumb(cv, cfg) {
+  const t = cv.getContext("2d");
+  const w = cv.width, h = cv.height;
+  t.fillStyle = "#0a0a18"; t.fillRect(0, 0, w, h);
+  t.fillStyle = "hsl(265, 50%, 16%)";                    // faint brick rows
+  for (let r = 0; r < 6; r++)
+    for (let c = -1; c < 10; c++)
+      t.fillRect(c * 22 + (r % 2 ? 11 : 0), r * 22 + 2, 19, 17);
+  t.fillStyle = cfg.kill.color;                          // lethal edges
+  t.fillRect(0, 0, w, 5); t.fillRect(0, h - 5, w, 5);
+  t.fillRect(w * 0.66, 5, 10, 36);                       // spiked gate pair
+  t.fillRect(w * 0.66, h - 41, 10, 36);
+  t.beginPath();                                         // teeth into the gap
+  t.moveTo(w * 0.66 + 1, 41); t.lineTo(w * 0.66 + 5, 47); t.lineTo(w * 0.66 + 9, 41);
+  t.moveTo(w * 0.66 + 1, h - 41); t.lineTo(w * 0.66 + 5, h - 47); t.lineTo(w * 0.66 + 9, h - 41);
+  t.fill();
+  t.strokeStyle = cfg.trail.color; t.lineWidth = 3; t.lineCap = "round";
+  t.beginPath();                                         // the wave trail
+  t.moveTo(18, h * 0.58); t.lineTo(64, h * 0.4); t.lineTo(w * 0.56, h * 0.54);
+  t.stroke();
+  const cy = h * 0.52, cx = w * 0.58;                    // the pink wedge
+  t.fillStyle = cfg.player.fill;
+  t.beginPath();
+  t.moveTo(cx + 16, cy); t.lineTo(cx - 6, cy - 6); t.lineTo(cx - 6, cy + 6);
+  t.closePath(); t.fill();
+  t.strokeStyle = cfg.player.outline; t.lineWidth = 1.5; t.stroke();
+}
+
+function modeConfig(id) {
+  return deepMerge(deepClone(BASE_CONFIG), MODES[id].overrides);
+}
+
+function refreshTileBests() {
+  for (const el of document.querySelectorAll(".tile-best")) {
+    const key = modeConfig(el.dataset.mode).score.bestKey;
+    let v = 0;
+    try { v = parseInt(localStorage.getItem(key) || "0", 10) || 0; } catch (e) {}
+    el.textContent = v > 0 ? "BEST " + v : "NO RECORD";
+  }
+}
+
+function buildLobby() {
+  const tiles = document.getElementById("tiles");
+  for (const id of Object.keys(MODES)) {
+    const m = MODES[id];
+    const btn = document.createElement("button");
+    btn.className = "tile";
+    const cv = document.createElement("canvas");
+    cv.width = 220; cv.height = 130;
+    paintThumb(cv, modeConfig(id));
+    const name = document.createElement("span");
+    name.className = "tile-name"; name.textContent = m.name;
+    const bestEl = document.createElement("span");
+    bestEl.className = "tile-best"; bestEl.dataset.mode = id;
+    btn.append(cv, name, bestEl);
+    btn.addEventListener("click", () => {
+      applyMode(id);
+      inLobby = false;
+      lobbyEl.style.display = "none";
+    });
+    tiles.appendChild(btn);
+  }
+  refreshTileBests();
+}
+
+function toLobby() {
+  applyMode(currentMode);       // resets the run for next time
+  inLobby = true;
+  lobbyEl.style.display = "flex";
+  refreshTileBests();
 }
 
 /* ---------- main loop --------------------------------------------------- */
@@ -772,10 +931,14 @@ function frame(now) {
   last = now;
   update(dt);
   draw();
+  deathEl.classList.toggle("visible", dead && deathT >= 0.6);
   requestAnimationFrame(frame);
 }
 
-best = loadBest();
+buildLobby();
+document.getElementById("btnRestart").addEventListener("click", restart);
+document.getElementById("btnLobby").addEventListener("click", toLobby);
+applyMode("classic");          // loads CONFIG + best; stays in the lobby
 resize();
 window.addEventListener("resize", resize);
 requestAnimationFrame(frame);

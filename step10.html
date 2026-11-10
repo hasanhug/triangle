@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Triangle Runner</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #05050c;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game" role="img" aria-label="Triangle Runner: a glowing triangle zigzagging between lethal edges, dodging red gates streaming past a distant dark brick wall"></canvas>
+
+<script>
+"use strict";
+/* =====================================================================
+   TRIANGLE RUNNER — v10: levels & caves.
+   20 obstacles per level; difficulty steps up only at boundaries — and
+   each boundary is guarded by a cave: a spiked funnel that pinches to a
+   throat (tighter every level) and reopens into the harder level.
+   Click/Space/tap; any input restarts after death.
+   v1 -> step1.html; ... v8 -> step8.html; v9 -> step9.html.
+
+   Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
+
+   Layout of this file:
+     CONFIG     every tunable number & color lives here
+     wall       seamless procedural brick texture (offscreen tile)
+     input      click / Space / tap -> toggle direction
+     player     the wedge (dir: -1 up, +1 down, 0 idle)
+     trail      fading wave ribbon drifting left behind the wedge
+     update()   world simulation, one call per frame
+     draw()     wall -> vignette -> trail -> player
+   ===================================================================== */
+
+const CONFIG = {
+  speedStart: 170,          // easy-start world speed; the difficulty curve owns the ramp
+  wallSpeedFactor: 0.7,     // faster backdrop — still behind the player for parallax
+  maxDt: 1 / 20,            // time-step clamp so a tab-switch can never teleport the world
+
+  wall: {
+    scale: 0.28,            // bricks ~26x12px — tiny, far away
+    brickW: 92,             // base brick cell size, CSS px (before scale)
+    brickH: 44,
+    mortar: 6,
+    colsPerTile: 24,        // dense tile: the pattern repeat stays ~620px wide at this scale
+    rowsPerTile: 10,        // (even, so the running-bond offset alternation wraps)
+    mortarColor: "#0c0c18",
+    hue:   [225, 305],      // each brick sampled here: deep indigo -> violet -> magenta
+    sat:   [45, 65],        // slightly muted + dark = hazy distance
+    light: [10, 20],
+    speckles: 0,            // grit dropped — sub-pixel specks just read as dirt
+    seed: 1337,             // fixed seed -> identical wall on every load & resize
+  },
+
+  player: {
+    width: 21,              // v5: 65% of v4 — a true speck (~1.6% of a 1280px window)
+    height: 11,
+    fill: "#ff2d95",        // hot pink — contrasts the blue/violet wall AND the white trail
+    outline: "#ffc3e6",     // pale pink edge: crisp without echoing the white trail
+    outlineWidth: 1,
+    laneX: 0.30,            // runner sits at 30% of window width
+    laneY: 0.56,            // idle lane before the first input
+    glow: { enabled: true, color: "rgba(255,45,149,0.85)", blur: 8 },
+    hitboxRadius: 5.5,      // forgiving: smaller than the visual wedge
+  },
+
+  input: {
+    space: true,            // Space toggles too, like GD
+    touch: true,            // tap toggles on touchscreens
+  },
+
+  wave: {
+    slope: 1.0,             // vertical speed = slope x worldSpeed; 1.0 = 45-degree diagonals
+  },
+
+  kill: {
+    height: 12,             // identical lethal strips at the very top and bottom edges
+    color: "#ff2244",       // (nothing between them can kill you — yet)
+    edge: "#ffb3c0",        // hot inner edge marking each exact boundary
+    ring: { max: 70, dur: 0.45 },   // death explosion rings
+  },
+
+  obstacles: {
+    columnWidth: 28,        // gate column width
+    blockW: 44,
+    blockH: 30,
+    color: "#ff2244",       // same hazard language as the kill strips
+    edge: "#ffb3c0",
+    spike: { len: 8 },      // chunky teeth on blocks + gate gap edges — lethal
+  },
+
+  difficulty: {
+    gatesPerLevel: 20,      // obstacles per level; each boundary = a cave
+    levelsToMax: 5,         // full difficulty at level 6 (t = (level-1)/5)
+    speed: [170, 420],      // world px/sec, stepped per level
+    gap: [190, 110],        // nominal gate gap (spike teeth eat 16px of it)
+    spacing: [480, 210],    // px between gates: ~2.8s at L1 -> ~0.5s at L6
+    reach: [0.4, 0.75],     // allowed altitude swing between gaps (x spacing)
+    blockChance: [0, 0.35],
+    blockStartLevel: 2,     // no floating blocks during level 1
+  },
+
+  cave: {
+    segWidth: 28,           // segment column width (matches gates)
+    segSpacing: 34,         // tight enough to read as continuous jagged walls
+    segments: 26,           // ~880px funnel
+    minGapStart: 110,       // level-1 throat, nominal (spikes eat 16px)
+    minGapShrink: 8,        // tighter per level
+    minGapFloor: 64,        // never narrower than this
+  },
+
+  score: {
+    bestKey: "triangleRunnerBest",   // localStorage; degrades silently if blocked
+  },
+
+  trail: {
+    enabled: true,
+    color: "#ffffff",       // white ribbon
+    maxAge: 0.7,            // seconds the ribbon lives (~180px at 260 px/s)
+    width: 3,
+    opaque: true,           // v6: solid core, no alpha fade along the ribbon
+    glow: 14,               // v6: much brighter — shadow-blurred core + wide halos
+    alpha: 0.8,             // only used when opaque is false
+  },
+
+  // Idle hover — v3: disabled (user preference: no wavy up/down motion).
+  bob: { enabled: false, amp: 2, speed: 2.4, tilt: 0.035 },
+
+  vignette: 0.35,           // darkening at the top/bottom edges; 0 turns it off
+};
+
+/* ---------- canvas & global state ---------------------------------- */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+let W = 0, H = 0;         // window size in CSS px
+let dpr = 1;              // device pixel ratio (sharp on HiDPI screens)
+let tileW = 0;            // wall tile size in CSS px = the wrap period
+let brickTile = null;     // offscreen canvas holding one seamless wall tile
+let wallPattern = null;
+let scrollX = 0;          // leftward travel; only (scrollX mod tileW) matters
+let worldSpeed = CONFIG.speedStart;   // player's true speed; future ramp goes here
+let groundY = 0;          // idle lane height
+let firstInput = false;   // trail only exists after the player first moves
+const trail = [];         // ribbon points: {x, y, age}; head pushed every frame
+let dead = false;         // v6: touched the kill strip
+let deathT = 0;           // seconds since death (drives the explosion + prompt)
+let deathX = 0, deathY = 0;
+let obstacles = [];       // live gates and blocks
+let score = 0;            // +1 per obstacle passed
+let best = 0;             // all-time best (localStorage when available)
+let spawnDist = 0;        // distance accumulated since the last gate spawn
+let nextGapCenter = 0;    // reachability chain anchor for gap placement
+let levelFlashT = 0;      // "LEVEL n" announcement timer
+let blockSprite = null;   // pre-rendered spiked block (device resolution)
+let gateEdgeTop = null;   // spiked strip: teeth pointing down into the gap
+let gateEdgeBot = null;   // spiked strip: teeth pointing up into the gap
+
+const player = {
+  x: 0,        // horizontal lane anchor (center of the wedge; fixed on screen)
+  y: 0,        // current vertical center
+  dir: 0,      // wave direction: -1 climbing, +1 diving, 0 idle (pre-first-click)
+  bobT: 0,     // clock for the (currently disabled) idle hover
+};
+
+/* ---------- seeded RNG: same wall every time ----------------------- */
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- the brick wall ------------------------------------------ */
+
+function drawBrick(t, x, y, w, h, fill, clipped, rand, s) {
+  const bev = Math.max(1, 2 * s);        // bevel/detail size follows brick scale
+
+  t.fillStyle = fill;
+  t.fillRect(x, y, w, h);
+
+  // bevel: a light top edge and dark bottom edge on every brick
+  t.fillStyle = "rgba(255,255,255,0.10)";
+  t.fillRect(x, y, w, bev);
+  t.fillStyle = "rgba(0,0,0,0.22)";
+  t.fillRect(x, y + h - bev, w, bev);
+
+  // grit: a few darker speckles (skipped on seam-straddling bricks so the
+  // half-brick at the tile's left edge matches the one at its right edge)
+  if (!clipped && CONFIG.wall.speckles > 0) {
+    t.fillStyle = "rgba(0,0,0,0.14)";
+    for (let i = 0; i < CONFIG.wall.speckles; i++) {
+      const sw = Math.max(1, (2 + rand() * 2) * s);
+      const sh = Math.max(1, 2 * s);
+      t.fillRect(x + 3 + rand() * (w - 6 - sw), y + 3 + rand() * (h - 6 - sh), sw, sh);
+    }
+  }
+}
+
+function buildWall() {
+  const w = CONFIG.wall;
+  const cols = w.colsPerTile;
+  const rows = w.rowsPerTile;
+  const bw = Math.round(w.brickW * w.scale);   // integer sizes keep the tile wrap exact
+  const bh = Math.round(w.brickH * w.scale);
+  const m = w.mortar * w.scale;
+  const s = w.scale;
+  tileW = cols * bw;
+  const tileH = rows * bh;
+
+  // Render the tile at device resolution when the browser lets a pattern
+  // be scaled back down; otherwise fall back to 1x (correct, slightly soft).
+  const canScalePattern =
+    typeof CanvasPattern !== "undefined" &&
+    typeof CanvasPattern.prototype.setTransform === "function" &&
+    typeof DOMMatrix !== "undefined";
+  const scale = canScalePattern ? dpr : 1;
+
+  brickTile = document.createElement("canvas");
+  brickTile.width = Math.round(tileW * scale);
+  brickTile.height = Math.round(tileH * scale);
+  const t = brickTile.getContext("2d");
+  t.scale(scale, scale);
+
+  const rand = mulberry32(w.seed);
+
+  // mortar background: gaps appear wherever a brick isn't drawn
+  t.fillStyle = w.mortarColor;
+  t.fillRect(0, 0, tileW, tileH);
+
+  // Running bond: even rows aligned, odd rows offset half a brick.
+  // Each row gets its own list of `cols` brick colors, indexed with modulo,
+  // so the half-bricks clipped at the tile's left and right edges share a
+  // color and the tile wraps seamlessly forever.
+  for (let row = 0; row < rows; row++) {
+    const shades = [];
+    for (let i = 0; i < cols; i++) {
+      const h = w.hue[0]   + rand() * (w.hue[1]   - w.hue[0]);
+      const s2 = w.sat[0]  + rand() * (w.sat[1]   - w.sat[0]);
+      const l = w.light[0] + rand() * (w.light[1] - w.light[0]);
+      shades.push("hsl(" + h.toFixed(1) + ", " + s2.toFixed(1) + "%, " + l.toFixed(1) + "%)");
+    }
+    const y = row * bh;
+    const offset = (row % 2 === 0) ? 0 : -bw / 2;
+    for (let i = 0; i <= cols; i++) {          // cols + 1: the extra wraps around
+      const x = offset + i * bw;
+      drawBrick(t, x + m / 2, y + m / 2, bw - m, bh - m,
+                shades[i % cols], x < 0 || x + bw > tileW, rand, s);
+    }
+  }
+
+  wallPattern = ctx.createPattern(brickTile, "repeat");
+  if (canScalePattern) {
+    // Tile was drawn at device resolution; scale it back so one pattern
+    // unit equals one CSS pixel in our (already dpr-scaled) context.
+    wallPattern.setTransform(new DOMMatrix().scale(1 / scale));
+  }
+}
+
+/* ---------- sizing --------------------------------------------------- */
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // reset by the width assignment above
+  buildWall();
+  buildSprites();
+  player.x = W * CONFIG.player.laneX;
+  groundY = H * CONFIG.player.laneY;
+  // A mid-flight resize re-clamps automatically on the next update().
+}
+
+/* ---------- input: click / Space / tap toggles the wave -------------- */
+
+function toggleDirection() {
+  // any input restarts — but only after the death screen (with the score)
+  // has been readable for a moment, so a mid-crash click can't wipe it
+  if (dead) { if (deathT >= 0.6) restart(); return; }
+  player.dir = (player.dir === 0) ? -1 : -player.dir;     // first click climbs
+  firstInput = true;
+}
+
+function die() {
+  dead = true;
+  deathT = 0;
+  deathX = player.x;
+  deathY = player.y;
+  if (score > best) { best = score; saveBest(); }
+}
+
+function restart() {
+  dead = false;
+  deathT = 0;
+  player.dir = 0;
+  player.y = groundY;
+  trail.length = 0;
+  firstInput = false;
+  obstacles.length = 0;      // clear the field...
+  spawnDist = 0;
+  score = 0;                 // ...and the score...
+  worldSpeed = CONFIG.speedStart;   // ...and the difficulty ramp
+}
+
+/* ---------- obstacles, score & the difficulty curve ------------------ */
+
+// Levels: difficulty is constant within a level and steps up every
+// `gatesPerLevel` obstacles, reaching full difficulty at level 6+.
+function currentLevel() {
+  return Math.floor(score / CONFIG.difficulty.gatesPerLevel) + 1;
+}
+
+function difficultyT() {
+  const d = CONFIG.difficulty;
+  return Math.min(1, (currentLevel() - 1) / d.levelsToMax);
+}
+
+function lerp(range, t) { return range[0] + (range[1] - range[0]) * t; }
+
+function gateGap()     { return lerp(CONFIG.difficulty.gap, difficultyT()); }
+function gateSpacing() { return lerp(CONFIG.difficulty.spacing, difficultyT()); }
+function gateReach()   { return lerp(CONFIG.difficulty.reach, difficultyT()); }
+
+function blockChanceNow() {
+  const d = CONFIG.difficulty;
+  return currentLevel() < d.blockStartLevel ? 0 : lerp(d.blockChance, difficultyT());
+}
+
+// Gaps stay reachable: at wave slope 1 the ship can change at most
+// `spacing` px of altitude before the next gate, so each new gap center
+// is sampled within ±70% of that around the previous one (the first gate
+// anchors to the ship's current position).
+function spawnGate() {
+  const o = CONFIG.obstacles;
+  const gapH = gateGap();
+  const reach = gateSpacing() * CONFIG.wave.slope * gateReach();
+  const anchor = (obstacles.length === 0) ? player.y : nextGapCenter;
+  const corridorTop = CONFIG.kill.height + 10 + gapH / 2;
+  const corridorBottom = H - CONFIG.kill.height - 10 - gapH / 2;
+  const lo = Math.max(corridorTop, anchor - reach);
+  const hi = Math.min(corridorBottom, anchor + reach);
+  const gapC = lo + Math.random() * Math.max(1, hi - lo);
+  nextGapCenter = gapC;
+  obstacles.push({ type: "gate", x: W + o.columnWidth,
+                   gapTop: gapC - gapH / 2, gapBottom: gapC + gapH / 2, passed: false });
+}
+
+function spawnBlock(x) {
+  const o = CONFIG.obstacles;
+  const y = CONFIG.kill.height + 10 +
+            Math.random() * (H - 2 * (CONFIG.kill.height + 10) - o.blockH);
+  obstacles.push({ type: "block", x, y, w: o.blockW, h: o.blockH, passed: false });
+}
+
+// The cave: a score-free spiked funnel guarding each level boundary.
+// The gap pinches from the finished level's width down to a throat, then
+// reopens into the next level's width. Gate spawning pauses while the
+// cave streams past (paid off as a negative spawnDist "debt").
+function spawnCave() {
+  const c = CONFIG.cave, d = CONFIG.difficulty;
+  const level = currentLevel();                        // already the new level
+  const tPrev = Math.max(0, (level - 2) / d.levelsToMax);
+  const entryGap = lerp(d.gap, tPrev);                 // matches the level just flown
+  const exitGap = lerp(d.gap, Math.min(1, (level - 1) / d.levelsToMax));
+  const minGap = Math.max(c.minGapFloor, c.minGapStart - c.minGapShrink * (level - 2));
+
+  // straight funnel: one constant center line, clamped so the throat fits
+  const cy = Math.max(CONFIG.kill.height + 18 + minGap / 2,
+              Math.min(H - CONFIG.kill.height - 18 - minGap / 2, nextGapCenter));
+  nextGapCenter = cy;                                  // post-cave gates chain from here
+
+  const half = Math.floor(c.segments / 2);
+  for (let i = 0; i < c.segments; i++) {
+    const dist = Math.abs(i - half) / half;            // 1 at the ends, 0 at the throat
+    const wide = (i < half) ? entryGap : exitGap;
+    const gap = wide + (minGap - wide) * (1 - dist);
+    obstacles.push({ type: "gate", x: W + 60 + i * c.segSpacing,
+                     gapTop: cy - gap / 2, gapBottom: cy + gap / 2,
+                     passed: true });                  // score-free: never counts
+  }
+  spawnDist = -(c.segments * c.segSpacing + 160);      // gate debt while the cave streams
+  levelFlashT = 1.4;                                   // "LEVEL n" announcement
+}
+
+function circleRect(cx, cy, r, rx, ry, rw, rh) {
+  const nx = Math.max(rx, Math.min(cx, rx + rw));
+  const ny = Math.max(ry, Math.min(cy, ry + rh));
+  const dx = cx - nx, dy = cy - ny;
+  return dx * dx + dy * dy < r * r;
+}
+
+function hitsObstacle(cx, cy, r, ob) {
+  const o = CONFIG.obstacles;
+  const s = o.spike.len;                        // spike tips are lethal too
+  if (ob.type === "gate") {
+    return circleRect(cx, cy, r, ob.x, 0, o.columnWidth, ob.gapTop + s) ||
+           circleRect(cx, cy, r, ob.x, ob.gapBottom - s, o.columnWidth, H - ob.gapBottom + s);
+  }
+  return circleRect(cx, cy, r, ob.x - s, ob.y - s, ob.w + 2 * s, ob.h + 2 * s);
+}
+
+/* ---------- spike sprites (pre-rendered once per size/dpr) ----------- */
+
+function teethH(t, x0, y, span, count, len, up) {   // teeth along a horizontal edge
+  t.beginPath();
+  for (let i = 0; i < count; i++) {
+    const xa = x0 + span * i / count, xb = x0 + span * (i + 1) / count;
+    t.moveTo(xa, y);
+    t.lineTo((xa + xb) / 2, up ? y - len : y + len);
+    t.lineTo(xb, y);
+    t.closePath();
+  }
+  t.fill();
+}
+
+function teethV(t, x, y0, span, count, len, left) { // teeth along a vertical edge
+  t.beginPath();
+  for (let i = 0; i < count; i++) {
+    const ya = y0 + span * i / count, yb = y0 + span * (i + 1) / count;
+    t.moveTo(x, ya);
+    t.lineTo(left ? x - len : x + len, (ya + yb) / 2);
+    t.lineTo(x, yb);
+    t.closePath();
+  }
+  t.fill();
+}
+
+function buildSprites() {
+  const o = CONFIG.obstacles, k = o.spike.len, sc = Math.max(1, dpr);
+  const mk = (w, h) => {                       // offscreen canvas at device res
+    const c = document.createElement("canvas");
+    c.width = Math.round(w * sc); c.height = Math.round(h * sc);
+    const t = c.getContext("2d"); t.scale(sc, sc);
+    return [c, t];
+  };
+
+  // spiked floating block: body + teeth on all four sides
+  const [bc, bt] = mk(o.blockW + 2 * k, o.blockH + 2 * k);
+  bt.fillStyle = o.color;
+  bt.fillRect(k, k, o.blockW, o.blockH);
+  teethH(bt, k, k, o.blockW, 4, k, true);
+  teethH(bt, k, k + o.blockH, o.blockW, 4, k, false);
+  teethV(bt, k, k, o.blockH, 3, k, true);
+  teethV(bt, k + o.blockW, k, o.blockH, 3, k, false);
+  blockSprite = bc;
+
+  // gate edge strips: hot line + two teeth pointing into the gap
+  const gw = o.columnWidth, eh = 2 + k;
+  const [tc, tt] = mk(gw, eh);
+  tt.fillStyle = o.edge; tt.fillRect(0, 0, gw, 2);
+  tt.fillStyle = o.color; teethH(tt, 0, 2, gw, 2, k, false);
+  gateEdgeTop = tc;
+
+  const [uc, ut] = mk(gw, eh);
+  ut.fillStyle = o.edge; ut.fillRect(0, k, gw, 2);
+  ut.fillStyle = o.color; teethH(ut, 0, k, gw, 2, k, true);
+  gateEdgeBot = uc;
+}
+
+function loadBest() {
+  try { return parseInt(localStorage.getItem(CONFIG.score.bestKey) || "0", 10) || 0; }
+  catch (e) { return 0; }
+}
+
+function saveBest() {
+  try { localStorage.setItem(CONFIG.score.bestKey, String(best)); } catch (e) {}
+}
+
+window.addEventListener("mousedown", function (e) {
+  if (e.button === 0) toggleDirection();
+});
+
+if (CONFIG.input.space) {
+  window.addEventListener("keydown", function (e) {
+    if (e.code === "Space" && !e.repeat) { e.preventDefault(); toggleDirection(); }
+  });
+}
+
+if (CONFIG.input.touch) {
+  window.addEventListener("touchstart", function (e) {
+    e.preventDefault();          // also suppresses the synthesized mouse event
+    toggleDirection();
+  }, { passive: false });
+}
+
+/* ---------- simulation ------------------------------------------------ */
+
+function update(dt) {
+  // Far wall scrolls slower than the player's true speed — the depth cue.
+  scrollX += worldSpeed * CONFIG.wallSpeedFactor * dt;
+  scrollX %= tileW;             // wrap immediately: no precision drift, even after hours
+
+  player.bobT += dt;
+  if (levelFlashT > 0) levelFlashT -= dt;
+
+  if (dead) {
+    deathT += dt;               // explosion timing; the world keeps scrolling
+  } else {
+    // Wave movement: instant velocity, straight diagonals. Both screen
+    // edges are lethal — there is nowhere safe to slide anymore.
+    if (player.dir !== 0) {
+      player.y += player.dir * worldSpeed * CONFIG.wave.slope * dt;
+      const halfH = CONFIG.player.height / 2;
+      if (player.y - halfH <= CONFIG.kill.height) die();            // top strip
+      else if (player.y + halfH >= H - CONFIG.kill.height) die();   // bottom strip
+    } else {
+      player.y = groundY;       // parked on the idle lane until the first click
+    }
+
+    // Obstacles: the run starts with the first input. Gates spawn on a
+    // spacing accumulator, stream left at world speed, +1 on pass, and
+    // kill on contact. Everything here freezes while dead.
+    if (firstInput) {
+      spawnDist += worldSpeed * dt;
+      const spacing = gateSpacing();
+      if (spawnDist >= spacing) {
+        spawnDist = 0;
+        spawnGate();
+        if (Math.random() < blockChanceNow()) {
+          spawnBlock(W + CONFIG.obstacles.columnWidth + spacing / 2);
+        }
+      }
+    }
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const ob = obstacles[i];
+      const ow = (ob.type === "gate") ? CONFIG.obstacles.columnWidth : ob.w;
+      ob.x -= worldSpeed * dt;
+      if (ob.x + ow < -80) { obstacles.splice(i, 1); continue; }
+      if (!ob.passed && ob.x + ow < player.x) {
+        ob.passed = true;
+        score++;
+        worldSpeed = lerp(CONFIG.difficulty.speed, difficultyT());  // level step
+        if (score % CONFIG.difficulty.gatesPerLevel === 0) spawnCave();
+      }
+      if (hitsObstacle(player.x, player.y, CONFIG.player.hitboxRadius, ob)) die();
+    }
+  }
+
+  // Wave trail: anchored to the world, so it drifts left at the player's
+  // true speed — a nearer plane than the wall, which deepens the parallax.
+  // (No outer length guard: the push below must be able to seed point #1.)
+  for (let i = 0; i < trail.length; i++) {
+    trail[i].x -= worldSpeed * dt;
+    trail[i].age += dt;
+  }
+  while (trail.length > 0 &&
+         (trail[0].age > CONFIG.trail.maxAge || trail[0].x < -60)) trail.shift();
+  if (!dead && firstInput) trail.push({ x: player.x, y: player.y, age: 0 });
+
+  /* ---- Remaining roadmap ----------------------------------------------
+     more obstacle patterns · juice (shake, pass-flash, audio) · menus
+     -------------------------------------------------------------------- */
+}
+
+/* ---------- rendering -------------------------------------------------- */
+
+function drawTrail() {
+  const tr = CONFIG.trail;
+  if (!tr.enabled || trail.length < 2) return;
+  const n = trail.length;      // index 0 = oldest, n-1 = newest (at the wedge)
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = tr.color;
+
+  const path = function (w) {                // stroke the whole ribbon at width w
+    ctx.lineWidth = w;
+    ctx.beginPath();
+    ctx.moveTo(trail[0].x, trail[0].y);
+    for (let i = 1; i < n; i++) ctx.lineTo(trail[i].x, trail[i].y);
+    ctx.stroke();
+  };
+
+  // v6: much brighter glow — two halo passes, then a shadow-blurred core
+  ctx.globalAlpha = 0.25; path(tr.width * 5);
+  ctx.globalAlpha = 0.45; path(tr.width * 2.2);
+  if (tr.opaque) {
+    ctx.globalAlpha = 1;
+    ctx.shadowColor = tr.color;
+    ctx.shadowBlur = tr.glow * dpr;          // shadowBlur ignores the ctx transform
+    path(tr.width);
+    ctx.shadowBlur = 0;
+  } else {
+    const buckets = 5;                       // legacy look: fading, thinning tail
+    for (let b = 0; b < buckets; b++) {
+      const lo = Math.floor(n * b / buckets);
+      const hi = Math.min(n - 1, Math.floor(n * (b + 1) / buckets));
+      if (hi <= lo) continue;
+      const t = (b + 1) / buckets;           // 0.2 (oldest) .. 1.0 (newest)
+      ctx.globalAlpha = t * tr.alpha;
+      ctx.lineWidth = Math.max(0.5, tr.width * t);
+      ctx.beginPath();
+      ctx.moveTo(trail[lo].x, trail[lo].y);
+      for (let i = lo + 1; i <= hi; i++) ctx.lineTo(trail[i].x, trail[i].y);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawPlayer() {
+  const p = CONFIG.player;
+  const b = CONFIG.bob;
+
+  const bobY = b.enabled ? Math.sin(player.bobT * b.speed) * b.amp : 0;
+  const tilt = b.enabled ? Math.sin(player.bobT * b.speed + 0.9) * b.tilt : 0;
+  const heading = tilt + player.dir * Math.atan(CONFIG.wave.slope);  // nose follows travel
+
+  ctx.save();
+  ctx.translate(player.x, player.y + bobY);
+  ctx.rotate(heading);
+
+  if (p.glow.enabled) {
+    ctx.shadowColor = p.glow.color;
+    ctx.shadowBlur = p.glow.blur * dpr;   // shadowBlur ignores the ctx transform
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(p.width * 0.55, 0);                          // nose tip (right)
+  ctx.lineTo(-p.width * 0.45, -p.height / 2);             // back, top corner
+  ctx.lineTo(-p.width * 0.45,  p.height / 2);             // back, bottom corner
+  ctx.closePath();
+
+  ctx.fillStyle = p.fill;
+  ctx.fill();
+  ctx.lineJoin = "round";
+  ctx.lineWidth = p.outlineWidth;
+  ctx.strokeStyle = p.outline;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawKillStrip() {
+  const k = CONFIG.kill;
+  ctx.save();
+  ctx.shadowColor = k.color;
+  ctx.shadowBlur = 10 * dpr;
+  ctx.fillStyle = k.color;
+  ctx.fillRect(0, 0, W, k.height);              // top block
+  ctx.fillRect(0, H - k.height, W, k.height);   // bottom block (identical)
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = k.edge;                       // hot edge = each exact lethal boundary
+  ctx.fillRect(0, k.height - 2, W, 2);          // top block's lower edge
+  ctx.fillRect(0, H - k.height, W, 2);          // bottom block's upper edge
+  ctx.restore();
+}
+
+function drawDeath() {
+  const k = CONFIG.kill.ring;
+  const t = Math.min(1, deathT / k.dur);
+  const ease = 1 - (1 - t) * (1 - t);        // ease-out expansion
+
+  ctx.save();
+  ctx.globalAlpha = 1 - t;
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = CONFIG.player.outline;   // pale pink ring
+  ctx.beginPath(); ctx.arc(deathX, deathY, ease * k.max, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = "#ffffff";               // white core ring
+  ctx.beginPath(); ctx.arc(deathX, deathY, ease * k.max * 0.6, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+
+  if (deathT > 0.25) {                       // restart prompt fades in
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, (deathT - 0.25) * 4);
+    ctx.font = "bold 26px 'Segoe UI', system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.shadowColor = "#ffffff";
+    ctx.shadowBlur = 12 * dpr;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText("CLICK TO RESTART", W / 2, H / 2);
+    ctx.font = "bold 22px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillText("SCORE " + score + "  ·  BEST " + best, W / 2, H / 2 + 42);
+    ctx.restore();
+  }
+}
+
+function drawObstacles() {
+  const o = CONFIG.obstacles;
+  const k = o.spike.len;
+  ctx.save();
+  ctx.shadowColor = o.color;
+  ctx.shadowBlur = 8 * dpr;
+  ctx.fillStyle = o.color;
+  for (const ob of obstacles) {
+    if (ob.type === "gate") {
+      ctx.fillRect(ob.x, 0, o.columnWidth, ob.gapTop);
+      ctx.fillRect(ob.x, ob.gapBottom, o.columnWidth, H - ob.gapBottom);
+    }
+  }
+  // spiked parts: sprites carry the teeth + hot edge, glow follows silhouette
+  for (const ob of obstacles) {
+    if (ob.type === "gate") {
+      ctx.drawImage(gateEdgeTop, ob.x, ob.gapTop - 2, o.columnWidth, 2 + k);
+      ctx.drawImage(gateEdgeBot, ob.x, ob.gapBottom - k, o.columnWidth, 2 + k);
+    } else {
+      ctx.drawImage(blockSprite, ob.x - k, ob.y - k, o.blockW + 2 * k, o.blockH + 2 * k);
+    }
+  }
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowColor = "#ffffff";
+  ctx.shadowBlur = 10 * dpr;
+  ctx.font = "bold 42px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText(String(score), W / 2, 80);
+  ctx.globalAlpha = 0.6;
+  ctx.shadowBlur = 4 * dpr;
+  ctx.font = "600 15px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("BEST " + best + "  ·  LV " + currentLevel(), W / 2, 104);
+  if (levelFlashT > 0) {                       // boundary announcement
+    ctx.globalAlpha = Math.min(1, levelFlashT / 0.4);
+    ctx.shadowBlur = 14 * dpr;
+    ctx.font = "bold 34px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillText("LEVEL " + currentLevel(), W / 2, H * 0.3);
+  }
+  ctx.restore();
+}
+
+function draw() {
+  // Wall: shift the pattern left, then fill the visible area.
+  ctx.save();
+  ctx.translate(-scrollX, 0);
+  ctx.fillStyle = wallPattern;
+  ctx.fillRect(scrollX, 0, W, H);
+  ctx.restore();
+
+  // Vignette: darker top & bottom so the wall recedes and the runner pops.
+  if (CONFIG.vignette > 0) {
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, "rgba(0,0,0," + CONFIG.vignette + ")");
+    grad.addColorStop(0.25, "rgba(0,0,0,0)");
+    grad.addColorStop(0.75, "rgba(0,0,0,0)");
+    grad.addColorStop(1, "rgba(0,0,0," + CONFIG.vignette + ")");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  drawObstacles();
+  drawTrail();
+  if (dead) drawDeath(); else drawPlayer();
+  drawKillStrip();
+  drawHUD();
+}
+
+/* ---------- main loop --------------------------------------------------- */
+
+let last = performance.now();
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, CONFIG.maxDt);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+best = loadBest();
+resize();
+window.addEventListener("resize", resize);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
