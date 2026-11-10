@@ -15,17 +15,18 @@
 </style>
 </head>
 <body>
-<canvas id="game" role="img" aria-label="Triangle Runner: a glowing triangle zigzagging up and down past a distant dark brick wall"></canvas>
+<canvas id="game" role="img" aria-label="Triangle Runner: a glowing triangle zigzagging between lethal edges, dodging red gates streaming past a distant dark brick wall"></canvas>
 
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v6: lethal edges, blinding trail.
-   Click/Space/tap toggles climb/dive. The very top AND bottom of the
-   screen are kill strips — touch either and you explode, then any input
-   restarts. The wave trail is opaque white with a bright glow.
+   TRIANGLE RUNNER — v7: obstacles + score.
+   Click/Space/tap toggles climb/dive between two lethal edges. Red gates
+   and blocks stream in once the run starts (first click); +1 per obstacle
+   passed, gentle speed/gap ramp, best score persists. The wave trail is
+   opaque white with a bright glow.
    v1 -> step1.html; v2 -> step2.html; v3 -> step3.html;
-   v4 -> step4.html; v5 -> step5.html.
+   v4 -> step4.html; v5 -> step5.html; v6 -> step6.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
@@ -68,6 +69,7 @@ const CONFIG = {
     laneX: 0.30,            // runner sits at 30% of window width
     laneY: 0.56,            // idle lane before the first input
     glow: { enabled: true, color: "rgba(255,45,149,0.85)", blur: 8 },
+    hitboxRadius: 5.5,      // forgiving: smaller than the visual wedge
   },
 
   input: {
@@ -84,6 +86,27 @@ const CONFIG = {
     color: "#ff2244",       // (nothing between them can kill you — yet)
     edge: "#ffb3c0",        // hot inner edge marking each exact boundary
     ring: { max: 70, dur: 0.45 },   // death explosion rings
+  },
+
+  obstacles: {
+    columnWidth: 28,        // gate column width
+    gapStart: 130,          // starting gap (~12 ship-heights)
+    gapMin: 100,
+    gapShrinkPerGate: 2,    // gentle ramp: gap tightens as score grows
+    spacingStart: 260,      // px between gates (~1s at start speed)
+    spacingMin: 200,
+    spacingShrinkPerGate: 1.5,
+    blockChance: 0.35,      // chance of a floating block between gates
+    blockW: 44,
+    blockH: 30,
+    speedRampPerGate: 3,    // worldSpeed += this per gate passed
+    speedMax: 420,
+    color: "#ff2244",       // same hazard language as the kill strips
+    edge: "#ffb3c0",
+  },
+
+  score: {
+    bestKey: "triangleRunnerBest",   // localStorage; degrades silently if blocked
   },
 
   trail: {
@@ -120,6 +143,11 @@ const trail = [];         // ribbon points: {x, y, age}; head pushed every frame
 let dead = false;         // v6: touched the kill strip
 let deathT = 0;           // seconds since death (drives the explosion + prompt)
 let deathX = 0, deathY = 0;
+let obstacles = [];       // live gates and blocks
+let score = 0;            // +1 per obstacle passed
+let best = 0;             // all-time best (localStorage when available)
+let spawnDist = 0;        // distance accumulated since the last gate spawn
+let nextGapCenter = 0;    // reachability chain anchor for gap placement
 
 const player = {
   x: 0,        // horizontal lane anchor (center of the wedge; fixed on screen)
@@ -246,7 +274,9 @@ function resize() {
 /* ---------- input: click / Space / tap toggles the wave -------------- */
 
 function toggleDirection() {
-  if (dead) { restart(); return; }                        // any input restarts after death
+  // any input restarts — but only after the death screen (with the score)
+  // has been readable for a moment, so a mid-crash click can't wipe it
+  if (dead) { if (deathT >= 0.6) restart(); return; }
   player.dir = (player.dir === 0) ? -1 : -player.dir;     // first click climbs
   firstInput = true;
 }
@@ -256,6 +286,7 @@ function die() {
   deathT = 0;
   deathX = player.x;
   deathY = player.y;
+  if (score > best) { best = score; saveBest(); }
 }
 
 function restart() {
@@ -265,6 +296,73 @@ function restart() {
   player.y = groundY;
   trail.length = 0;
   firstInput = false;
+  obstacles.length = 0;      // clear the field...
+  spawnDist = 0;
+  score = 0;                 // ...and the score...
+  worldSpeed = CONFIG.speedStart;   // ...and the difficulty ramp
+}
+
+/* ---------- obstacles & score ---------------------------------------- */
+
+function gateGap() {
+  const o = CONFIG.obstacles;
+  return Math.max(o.gapMin, o.gapStart - score * o.gapShrinkPerGate);
+}
+
+function gateSpacing() {
+  const o = CONFIG.obstacles;
+  return Math.max(o.spacingMin, o.spacingStart - score * o.spacingShrinkPerGate);
+}
+
+// Gaps stay reachable: at wave slope 1 the ship can change at most
+// `spacing` px of altitude before the next gate, so each new gap center
+// is sampled within ±70% of that around the previous one (the first gate
+// anchors to the ship's current position).
+function spawnGate() {
+  const o = CONFIG.obstacles;
+  const gapH = gateGap();
+  const reach = gateSpacing() * CONFIG.wave.slope * 0.7;
+  const anchor = (obstacles.length === 0) ? player.y : nextGapCenter;
+  const corridorTop = CONFIG.kill.height + 10 + gapH / 2;
+  const corridorBottom = H - CONFIG.kill.height - 10 - gapH / 2;
+  const lo = Math.max(corridorTop, anchor - reach);
+  const hi = Math.min(corridorBottom, anchor + reach);
+  const gapC = lo + Math.random() * Math.max(1, hi - lo);
+  nextGapCenter = gapC;
+  obstacles.push({ type: "gate", x: W + o.columnWidth,
+                   gapTop: gapC - gapH / 2, gapBottom: gapC + gapH / 2, passed: false });
+}
+
+function spawnBlock(x) {
+  const o = CONFIG.obstacles;
+  const y = CONFIG.kill.height + 10 +
+            Math.random() * (H - 2 * (CONFIG.kill.height + 10) - o.blockH);
+  obstacles.push({ type: "block", x, y, w: o.blockW, h: o.blockH, passed: false });
+}
+
+function circleRect(cx, cy, r, rx, ry, rw, rh) {
+  const nx = Math.max(rx, Math.min(cx, rx + rw));
+  const ny = Math.max(ry, Math.min(cy, ry + rh));
+  const dx = cx - nx, dy = cy - ny;
+  return dx * dx + dy * dy < r * r;
+}
+
+function hitsObstacle(cx, cy, r, ob) {
+  const o = CONFIG.obstacles;
+  if (ob.type === "gate") {
+    return circleRect(cx, cy, r, ob.x, 0, o.columnWidth, ob.gapTop) ||
+           circleRect(cx, cy, r, ob.x, ob.gapBottom, o.columnWidth, H - ob.gapBottom);
+  }
+  return circleRect(cx, cy, r, ob.x, ob.y, ob.w, ob.h);
+}
+
+function loadBest() {
+  try { return parseInt(localStorage.getItem(CONFIG.score.bestKey) || "0", 10) || 0; }
+  catch (e) { return 0; }
+}
+
+function saveBest() {
+  try { localStorage.setItem(CONFIG.score.bestKey, String(best)); } catch (e) {}
 }
 
 window.addEventListener("mousedown", function (e) {
@@ -306,6 +404,34 @@ function update(dt) {
     } else {
       player.y = groundY;       // parked on the idle lane until the first click
     }
+
+    // Obstacles: the run starts with the first input. Gates spawn on a
+    // spacing accumulator, stream left at world speed, +1 on pass, and
+    // kill on contact. Everything here freezes while dead.
+    if (firstInput) {
+      spawnDist += worldSpeed * dt;
+      const spacing = gateSpacing();
+      if (spawnDist >= spacing) {
+        spawnDist = 0;
+        spawnGate();
+        if (Math.random() < CONFIG.obstacles.blockChance) {
+          spawnBlock(W + CONFIG.obstacles.columnWidth + spacing / 2);
+        }
+      }
+    }
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const ob = obstacles[i];
+      const ow = (ob.type === "gate") ? CONFIG.obstacles.columnWidth : ob.w;
+      ob.x -= worldSpeed * dt;
+      if (ob.x + ow < -80) { obstacles.splice(i, 1); continue; }
+      if (!ob.passed && ob.x + ow < player.x) {
+        ob.passed = true;
+        score++;
+        worldSpeed = Math.min(CONFIG.obstacles.speedMax,     // gentle ramp
+                              worldSpeed + CONFIG.obstacles.speedRampPerGate);
+      }
+      if (hitsObstacle(player.x, player.y, CONFIG.player.hitboxRadius, ob)) die();
+    }
   }
 
   // Wave trail: anchored to the world, so it drifts left at the player's
@@ -319,11 +445,8 @@ function update(dt) {
          (trail[0].age > CONFIG.trail.maxAge || trail[0].x < -60)) trail.shift();
   if (!dead && firstInput) trail.push({ x: player.x, y: player.y, age: 0 });
 
-  /* ---- Future endless-runner systems slot in here --------------------
-     updateObstacles(dt)   spawn on the right, move left at worldSpeed, recycle
-     updateScore(dt)       score += worldSpeed * dt
-     speed ramp            worldSpeed += CONFIG.speedRamp * dt
-     collisions            obstacles (the lethal top/bottom strips are live)
+  /* ---- Remaining roadmap ----------------------------------------------
+     more obstacle patterns · juice (shake, pass-flash, audio) · menus
      -------------------------------------------------------------------- */
 }
 
@@ -444,8 +567,49 @@ function drawDeath() {
     ctx.shadowBlur = 12 * dpr;
     ctx.fillStyle = "#ffffff";
     ctx.fillText("CLICK TO RESTART", W / 2, H / 2);
+    ctx.font = "bold 22px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillText("SCORE " + score + "  ·  BEST " + best, W / 2, H / 2 + 42);
     ctx.restore();
   }
+}
+
+function drawObstacles() {
+  const o = CONFIG.obstacles;
+  ctx.save();
+  ctx.shadowColor = o.color;
+  ctx.shadowBlur = 8 * dpr;
+  ctx.fillStyle = o.color;
+  for (const ob of obstacles) {
+    if (ob.type === "gate") {
+      ctx.fillRect(ob.x, 0, o.columnWidth, ob.gapTop);
+      ctx.fillRect(ob.x, ob.gapBottom, o.columnWidth, H - ob.gapBottom);
+    } else {
+      ctx.fillRect(ob.x, ob.y, ob.w, ob.h);
+    }
+  }
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = o.edge;                    // hot edges around each gap
+  for (const ob of obstacles) {
+    if (ob.type !== "gate") continue;
+    ctx.fillRect(ob.x, ob.gapTop - 2, o.columnWidth, 2);
+    ctx.fillRect(ob.x, ob.gapBottom, o.columnWidth, 2);
+  }
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowColor = "#ffffff";
+  ctx.shadowBlur = 10 * dpr;
+  ctx.font = "bold 42px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText(String(score), W / 2, 80);
+  ctx.globalAlpha = 0.6;
+  ctx.shadowBlur = 4 * dpr;
+  ctx.font = "600 15px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("BEST " + best, W / 2, 104);
+  ctx.restore();
 }
 
 function draw() {
@@ -467,9 +631,11 @@ function draw() {
     ctx.fillRect(0, 0, W, H);
   }
 
+  drawObstacles();
   drawTrail();
   if (dead) drawDeath(); else drawPlayer();
   drawKillStrip();
+  drawHUD();
 }
 
 /* ---------- main loop --------------------------------------------------- */
@@ -484,6 +650,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
+best = loadBest();
 resize();
 window.addEventListener("resize", resize);
 requestAnimationFrame(frame);
