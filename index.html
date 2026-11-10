@@ -71,12 +71,12 @@
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v12: CAVES mode.
-   The lobby now has two tiles: CLASSIC (the full v10 game) and CAVES —
-   an endless chain of narrowing, accelerating caves, each level
-   announced with the minimum clicks-per-second its throat demands,
-   plus a live CPS readout on the HUD.
-   v1 -> step1.html; ... v10 -> step10.html; v11 -> step11.html.
+   TRIANGLE RUNNER — v13: the permanent line.
+   The white trail never fades: the ship's entire trajectory stays
+   visible as one thin 2px line, deleted only as points drift off the
+   left edge. No trail glow — plain solid white. Lobby: CLASSIC +
+   CAVES (narrowing cave chain with MIN-clicks-per-second banners).
+   v1 -> step1.html; ... v11 -> step11.html; v12 -> step12.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
@@ -174,12 +174,8 @@ const BASE_CONFIG = {
 
   trail: {
     enabled: true,
-    color: "#ffffff",       // white ribbon
-    maxAge: 0.7,            // seconds the ribbon lives (~180px at 260 px/s)
-    width: 3,
-    opaque: true,           // v6: solid core, no alpha fade along the ribbon
-    glow: 14,               // v6: much brighter — shadow-blurred core + wide halos
-    alpha: 0.8,             // only used when opaque is false
+    color: "#ffffff",       // plain white line
+    width: 2,               // v13: thin solid line — the whole trajectory stays
   },
 
   // Idle hover — v3: disabled (user preference: no wavy up/down motion).
@@ -716,15 +712,12 @@ function update(dt) {
   }
 
   // Wave trail: anchored to the world, so it drifts left at the player's
-  // true speed — a nearer plane than the wall, which deepens the parallax.
-  // (No outer length guard: the push below must be able to seed point #1.)
-  for (let i = 0; i < trail.length; i++) {
-    trail[i].x -= worldSpeed * dt;
-    trail[i].age += dt;
-  }
-  while (trail.length > 0 &&
-         (trail[0].age > CONFIG.trail.maxAge || trail[0].x < -60)) trail.shift();
-  if (!dead && firstInput) trail.push({ x: player.x, y: player.y, age: 0 });
+  // true speed. v13: the line never fades — points are deleted only once
+  // they leave the screen (plus a hard cap as insurance).
+  for (let i = 0; i < trail.length; i++) trail[i].x -= worldSpeed * dt;
+  while (trail.length > 0 && trail[0].x < -60) trail.shift();
+  if (trail.length > 2000) trail.splice(0, trail.length - 2000);
+  if (!dead && firstInput) trail.push({ x: player.x, y: player.y });
 
   /* ---- Remaining roadmap ----------------------------------------------
      more obstacle patterns · juice (shake, pass-flash, audio) · menus
@@ -736,45 +729,17 @@ function update(dt) {
 function drawTrail() {
   const tr = CONFIG.trail;
   if (!tr.enabled || trail.length < 2) return;
-  const n = trail.length;      // index 0 = oldest, n-1 = newest (at the wedge)
 
+  // v13: one plain opaque line — the whole trajectory, no glow, no fade
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.strokeStyle = tr.color;
-
-  const path = function (w) {                // stroke the whole ribbon at width w
-    ctx.lineWidth = w;
-    ctx.beginPath();
-    ctx.moveTo(trail[0].x, trail[0].y);
-    for (let i = 1; i < n; i++) ctx.lineTo(trail[i].x, trail[i].y);
-    ctx.stroke();
-  };
-
-  // v6: much brighter glow — two halo passes, then a shadow-blurred core
-  ctx.globalAlpha = 0.25; path(tr.width * 5);
-  ctx.globalAlpha = 0.45; path(tr.width * 2.2);
-  if (tr.opaque) {
-    ctx.globalAlpha = 1;
-    ctx.shadowColor = tr.color;
-    ctx.shadowBlur = tr.glow * dpr;          // shadowBlur ignores the ctx transform
-    path(tr.width);
-    ctx.shadowBlur = 0;
-  } else {
-    const buckets = 5;                       // legacy look: fading, thinning tail
-    for (let b = 0; b < buckets; b++) {
-      const lo = Math.floor(n * b / buckets);
-      const hi = Math.min(n - 1, Math.floor(n * (b + 1) / buckets));
-      if (hi <= lo) continue;
-      const t = (b + 1) / buckets;           // 0.2 (oldest) .. 1.0 (newest)
-      ctx.globalAlpha = t * tr.alpha;
-      ctx.lineWidth = Math.max(0.5, tr.width * t);
-      ctx.beginPath();
-      ctx.moveTo(trail[lo].x, trail[lo].y);
-      for (let i = lo + 1; i <= hi; i++) ctx.lineTo(trail[i].x, trail[i].y);
-      ctx.stroke();
-    }
-  }
+  ctx.lineWidth = tr.width;
+  ctx.beginPath();
+  ctx.moveTo(trail[0].x, trail[0].y);
+  for (let i = 1; i < trail.length; i++) ctx.lineTo(trail[i].x, trail[i].y);
+  ctx.stroke();
   ctx.restore();
 }
 
