@@ -20,13 +20,11 @@
 <script>
 "use strict";
 /* =====================================================================
-   TRIANGLE RUNNER — v7: obstacles + score.
-   Click/Space/tap toggles climb/dive between two lethal edges. Red gates
-   and blocks stream in once the run starts (first click); +1 per obstacle
-   passed, gentle speed/gap ramp, best score persists. The wave trail is
-   opaque white with a bright glow.
-   v1 -> step1.html; v2 -> step2.html; v3 -> step3.html;
-   v4 -> step4.html; v5 -> step5.html; v6 -> step6.html.
+   TRIANGLE RUNNER — v8: everything red has teeth.
+   Gap columns and floating blocks now wear chunky lethal spikes; the
+   wave toggle threads you through. +1 per obstacle passed, gentle ramp,
+   best score persists. Click/Space/tap; any input restarts after death.
+   v1 -> step1.html; ... v6 -> step6.html; v7 -> step7.html.
 
    Vanilla JS + Canvas 2D. One file, no assets, no dependencies.
 
@@ -90,8 +88,8 @@ const CONFIG = {
 
   obstacles: {
     columnWidth: 28,        // gate column width
-    gapStart: 130,          // starting gap (~12 ship-heights)
-    gapMin: 100,
+    gapStart: 140,          // spikes eat 16px of gap, so effective ~124 (v7 feel)
+    gapMin: 110,
     gapShrinkPerGate: 2,    // gentle ramp: gap tightens as score grows
     spacingStart: 260,      // px between gates (~1s at start speed)
     spacingMin: 200,
@@ -103,6 +101,7 @@ const CONFIG = {
     speedMax: 420,
     color: "#ff2244",       // same hazard language as the kill strips
     edge: "#ffb3c0",
+    spike: { len: 8 },      // chunky teeth on blocks + gate gap edges — lethal
   },
 
   score: {
@@ -148,6 +147,9 @@ let score = 0;            // +1 per obstacle passed
 let best = 0;             // all-time best (localStorage when available)
 let spawnDist = 0;        // distance accumulated since the last gate spawn
 let nextGapCenter = 0;    // reachability chain anchor for gap placement
+let blockSprite = null;   // pre-rendered spiked block (device resolution)
+let gateEdgeTop = null;   // spiked strip: teeth pointing down into the gap
+let gateEdgeBot = null;   // spiked strip: teeth pointing up into the gap
 
 const player = {
   x: 0,        // horizontal lane anchor (center of the wedge; fixed on screen)
@@ -266,6 +268,7 @@ function resize() {
   canvas.style.height = H + "px";
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // reset by the width assignment above
   buildWall();
+  buildSprites();
   player.x = W * CONFIG.player.laneX;
   groundY = H * CONFIG.player.laneY;
   // A mid-flight resize re-clamps automatically on the next update().
@@ -349,11 +352,70 @@ function circleRect(cx, cy, r, rx, ry, rw, rh) {
 
 function hitsObstacle(cx, cy, r, ob) {
   const o = CONFIG.obstacles;
+  const s = o.spike.len;                        // spike tips are lethal too
   if (ob.type === "gate") {
-    return circleRect(cx, cy, r, ob.x, 0, o.columnWidth, ob.gapTop) ||
-           circleRect(cx, cy, r, ob.x, ob.gapBottom, o.columnWidth, H - ob.gapBottom);
+    return circleRect(cx, cy, r, ob.x, 0, o.columnWidth, ob.gapTop + s) ||
+           circleRect(cx, cy, r, ob.x, ob.gapBottom - s, o.columnWidth, H - ob.gapBottom + s);
   }
-  return circleRect(cx, cy, r, ob.x, ob.y, ob.w, ob.h);
+  return circleRect(cx, cy, r, ob.x - s, ob.y - s, ob.w + 2 * s, ob.h + 2 * s);
+}
+
+/* ---------- spike sprites (pre-rendered once per size/dpr) ----------- */
+
+function teethH(t, x0, y, span, count, len, up) {   // teeth along a horizontal edge
+  t.beginPath();
+  for (let i = 0; i < count; i++) {
+    const xa = x0 + span * i / count, xb = x0 + span * (i + 1) / count;
+    t.moveTo(xa, y);
+    t.lineTo((xa + xb) / 2, up ? y - len : y + len);
+    t.lineTo(xb, y);
+    t.closePath();
+  }
+  t.fill();
+}
+
+function teethV(t, x, y0, span, count, len, left) { // teeth along a vertical edge
+  t.beginPath();
+  for (let i = 0; i < count; i++) {
+    const ya = y0 + span * i / count, yb = y0 + span * (i + 1) / count;
+    t.moveTo(x, ya);
+    t.lineTo(left ? x - len : x + len, (ya + yb) / 2);
+    t.lineTo(x, yb);
+    t.closePath();
+  }
+  t.fill();
+}
+
+function buildSprites() {
+  const o = CONFIG.obstacles, k = o.spike.len, sc = Math.max(1, dpr);
+  const mk = (w, h) => {                       // offscreen canvas at device res
+    const c = document.createElement("canvas");
+    c.width = Math.round(w * sc); c.height = Math.round(h * sc);
+    const t = c.getContext("2d"); t.scale(sc, sc);
+    return [c, t];
+  };
+
+  // spiked floating block: body + teeth on all four sides
+  const [bc, bt] = mk(o.blockW + 2 * k, o.blockH + 2 * k);
+  bt.fillStyle = o.color;
+  bt.fillRect(k, k, o.blockW, o.blockH);
+  teethH(bt, k, k, o.blockW, 4, k, true);
+  teethH(bt, k, k + o.blockH, o.blockW, 4, k, false);
+  teethV(bt, k, k, o.blockH, 3, k, true);
+  teethV(bt, k + o.blockW, k, o.blockH, 3, k, false);
+  blockSprite = bc;
+
+  // gate edge strips: hot line + two teeth pointing into the gap
+  const gw = o.columnWidth, eh = 2 + k;
+  const [tc, tt] = mk(gw, eh);
+  tt.fillStyle = o.edge; tt.fillRect(0, 0, gw, 2);
+  tt.fillStyle = o.color; teethH(tt, 0, 2, gw, 2, k, false);
+  gateEdgeTop = tc;
+
+  const [uc, ut] = mk(gw, eh);
+  ut.fillStyle = o.edge; ut.fillRect(0, k, gw, 2);
+  ut.fillStyle = o.color; teethH(ut, 0, k, gw, 2, k, true);
+  gateEdgeBot = uc;
 }
 
 function loadBest() {
@@ -575,6 +637,7 @@ function drawDeath() {
 
 function drawObstacles() {
   const o = CONFIG.obstacles;
+  const k = o.spike.len;
   ctx.save();
   ctx.shadowColor = o.color;
   ctx.shadowBlur = 8 * dpr;
@@ -583,16 +646,16 @@ function drawObstacles() {
     if (ob.type === "gate") {
       ctx.fillRect(ob.x, 0, o.columnWidth, ob.gapTop);
       ctx.fillRect(ob.x, ob.gapBottom, o.columnWidth, H - ob.gapBottom);
-    } else {
-      ctx.fillRect(ob.x, ob.y, ob.w, ob.h);
     }
   }
-  ctx.shadowBlur = 0;
-  ctx.fillStyle = o.edge;                    // hot edges around each gap
+  // spiked parts: sprites carry the teeth + hot edge, glow follows silhouette
   for (const ob of obstacles) {
-    if (ob.type !== "gate") continue;
-    ctx.fillRect(ob.x, ob.gapTop - 2, o.columnWidth, 2);
-    ctx.fillRect(ob.x, ob.gapBottom, o.columnWidth, 2);
+    if (ob.type === "gate") {
+      ctx.drawImage(gateEdgeTop, ob.x, ob.gapTop - 2, o.columnWidth, 2 + k);
+      ctx.drawImage(gateEdgeBot, ob.x, ob.gapBottom - k, o.columnWidth, 2 + k);
+    } else {
+      ctx.drawImage(blockSprite, ob.x - k, ob.y - k, o.blockW + 2 * k, o.blockH + 2 * k);
+    }
   }
   ctx.restore();
 }
